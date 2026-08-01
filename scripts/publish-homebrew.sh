@@ -70,7 +70,6 @@ write_formula() {
 class ${FORMULA_CLASS} < Formula
   desc "CBOR command-line converter and diagnostic notation inspector"
   homepage "https://github.com/${REPO}"
-  version "${VERSION}"
   license "MIT"
 
   on_macos do
@@ -115,7 +114,6 @@ if [ -z "${CHECKSUM_DIR:-}" ]; then
 fi
 
 TAG=$(normalize_tag "$TAG")
-VERSION="${TAG#v}"
 BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
 
 info "Generating Homebrew formula for ${REPO} ${TAG}..."

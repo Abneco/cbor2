@@ -20,7 +20,6 @@ fn derive_consumer_fixtures() {
                     "check"
                 },
                 "--offline",
-                "--locked",
                 "--manifest-path",
             ])
             .arg(&manifest)

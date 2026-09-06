@@ -3,3 +3,5 @@ misc
 tags
 build
 target
+cbor2-bench/Cargo.lock
+tests/derive-fixtures/Cargo.lock

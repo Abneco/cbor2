@@ -383,8 +383,8 @@ fn hex_nibbles_to_bytes(nibbles: &[u8], offset: usize) -> Result<Vec<u8>, Error>
         return Err(Error::Syntax(offset));
     }
     let mut out = Vec::with_capacity(nibbles.len() / 2);
-    for pair in nibbles.chunks_exact(2) {
-        out.push((pair[0] << 4) | pair[1]);
+    for &[high, low] in nibbles.as_chunks::<2>().0 {
+        out.push((high << 4) | low);
     }
     Ok(out)
 }

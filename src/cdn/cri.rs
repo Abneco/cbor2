@@ -7,7 +7,6 @@ use super::ip::{parse_ipv4, parse_ipv6};
 use super::parser::Parser;
 use super::types::{Atom, BigInt, Indicator, CRI_TAG};
 
-#[cfg(feature = "cdn")]
 pub(super) fn cri_atom(content: &str, tagged: bool, offset: usize) -> Result<Atom, Error> {
     let iri = iref::IriRef::new(content)
         .map_err(|_| Error::semantic(offset, "cri requires a valid IRI reference"))?;
@@ -22,7 +21,6 @@ pub(super) fn cri_atom(content: &str, tagged: bool, offset: usize) -> Result<Ato
     }
 }
 
-#[cfg(feature = "cdn")]
 fn cri_reference_bytes(iri: &iref::IriRef, offset: usize) -> Result<Vec<u8>, Error> {
     let mut sections = Vec::new();
 
@@ -68,7 +66,6 @@ fn cri_reference_bytes(iri: &iref::IriRef, offset: usize) -> Result<Vec<u8>, Err
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn trim_cri_defaults(sections: &mut Vec<Vec<u8>>) {
     while sections
         .last()
@@ -78,7 +75,6 @@ fn trim_cri_defaults(sections: &mut Vec<Vec<u8>>) {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn cri_scheme_bytes(scheme: &str) -> Result<Vec<u8>, Error> {
     let lower = scheme.to_ascii_lowercase();
     if let Some(number) = cri_scheme_number(&lower) {
@@ -88,7 +84,6 @@ fn cri_scheme_bytes(scheme: &str) -> Result<Vec<u8>, Error> {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn cri_scheme_number(scheme: &str) -> Option<u64> {
     match scheme {
         "coap" => Some(0),
@@ -105,7 +100,6 @@ fn cri_scheme_number(scheme: &str) -> Option<u64> {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn cri_no_authority_bytes(path: &str) -> Vec<u8> {
     if path.is_empty() || path.starts_with('/') {
         write_simple_value(22).expect("null is encodable")
@@ -114,7 +108,6 @@ fn cri_no_authority_bytes(path: &str) -> Vec<u8> {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn cri_discard_bytes(path: &str) -> Vec<u8> {
     if path.starts_with('/') {
         write_simple_value(21).expect("true is encodable")
@@ -125,7 +118,6 @@ fn cri_discard_bytes(path: &str) -> Vec<u8> {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn cri_authority_bytes(authority: &iref::iri::Authority, offset: usize) -> Result<Vec<u8>, Error> {
     let mut items = Vec::new();
     if let Some(user_info) = authority.user_info() {
@@ -169,7 +161,6 @@ fn cri_authority_bytes(authority: &iref::iri::Authority, offset: usize) -> Resul
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn host_ip_bytes(host: &str, offset: usize) -> Result<Option<Vec<u8>>, Error> {
     if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
         if inner.starts_with(['v', 'V']) {
@@ -188,13 +179,12 @@ fn host_ip_bytes(host: &str, offset: usize) -> Result<Option<Vec<u8>>, Error> {
     }
 
     if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') && host.contains('.') {
-        return parse_ipv4(host, offset).map(|bytes| Some(bytes.to_vec()));
+        return Ok(parse_ipv4(host, offset).ok().map(|bytes| bytes.to_vec()));
     }
 
     Ok(None)
 }
 
-#[cfg(feature = "cdn")]
 fn cri_path_bytes(path: &str, offset: usize) -> Result<Vec<u8>, Error> {
     let raw_segments: Vec<&str> = if path.is_empty() {
         Vec::new()
@@ -219,7 +209,6 @@ fn cri_path_bytes(path: &str, offset: usize) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn cri_query_bytes(query: &str, offset: usize) -> Result<Vec<u8>, Error> {
     let params: Vec<&str> = query.split('&').collect();
     let mut out = Vec::new();
@@ -231,42 +220,36 @@ fn cri_query_bytes(query: &str, offset: usize) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn cri_text_bytes(text: &str) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     write_definite_text(&mut out, text, Indicator::None)?;
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn cri_bytes_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     write_definite_bytes(&mut out, bytes, Indicator::None)?;
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn write_empty_array() -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     write_array_len(&mut out, 0)?;
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn write_simple_value(value: u8) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     Parser::new("").write_simple(&mut out, value, Indicator::None)?;
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 fn write_i128(value: i128) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     Parser::new("").write_integer(&mut out, &BigInt::from_i128(value), Indicator::None)?;
     Ok(out)
 }
 
-#[cfg(feature = "cdn")]
 #[derive(Clone, Copy)]
 enum PercentContext {
     UserInfo,
@@ -276,7 +259,6 @@ enum PercentContext {
     Fragment,
 }
 
-#[cfg(feature = "cdn")]
 fn percent_decode_component(
     input: &str,
     context: PercentContext,
@@ -305,7 +287,6 @@ fn percent_decode_component(
         .map_err(|_| Error::semantic(offset, "CRI percent-decoded text is not UTF-8"))
 }
 
-#[cfg(feature = "cdn")]
 fn validate_percent_decoded(byte: u8, context: PercentContext, offset: usize) -> Result<(), Error> {
     if !byte.is_ascii() || is_unreserved(byte) {
         return Ok(());
@@ -337,7 +318,6 @@ fn validate_percent_decoded(byte: u8, context: PercentContext, offset: usize) ->
     }
 }
 
-#[cfg(feature = "cdn")]
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -347,12 +327,10 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn is_unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
-#[cfg(feature = "cdn")]
 fn is_sub_delim(byte: u8) -> bool {
     matches!(
         byte,
@@ -360,22 +338,18 @@ fn is_sub_delim(byte: u8) -> bool {
     )
 }
 
-#[cfg(feature = "cdn")]
 fn is_userinfo_uri_char(byte: u8) -> bool {
     is_unreserved(byte) || is_sub_delim(byte) || byte == b':'
 }
 
-#[cfg(feature = "cdn")]
 fn is_host_uri_char(byte: u8) -> bool {
     is_unreserved(byte) || is_sub_delim(byte)
 }
 
-#[cfg(feature = "cdn")]
 fn is_path_uri_char(byte: u8) -> bool {
     is_unreserved(byte) || is_sub_delim(byte) || matches!(byte, b':' | b'@')
 }
 
-#[cfg(feature = "cdn")]
 fn is_query_fragment_uri_char(byte: u8) -> bool {
     is_path_uri_char(byte) || matches!(byte, b'/' | b'?')
 }

@@ -8,7 +8,10 @@ use super::types::{Atom, Indicator};
 pub(super) fn ip_atom(content: &str, tagged: bool, offset: usize) -> Result<Atom, Error> {
     let (addr, prefix) = match content.split_once('/') {
         Some((addr, prefix)) => {
-            if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+            if prefix.is_empty()
+                || (prefix.len() > 1 && prefix.starts_with('0'))
+                || !prefix.bytes().all(|b| b.is_ascii_digit())
+            {
                 return Err(Error::Syntax(offset));
             }
             let prefix = prefix
@@ -84,98 +87,17 @@ enum IpAddr {
 }
 
 pub(super) fn parse_ipv4(input: &str, offset: usize) -> Result<[u8; 4], Error> {
-    let mut out = [0u8; 4];
-    let mut count = 0usize;
-    for part in input.split('.') {
-        if count == 4 || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(Error::Syntax(offset));
-        }
-        let value = part.parse::<u16>().map_err(|_| Error::Syntax(offset))?;
-        if value > 255 {
-            return Err(Error::Syntax(offset));
-        }
-        out[count] = value as u8;
-        count += 1;
-    }
-    if count == 4 {
-        Ok(out)
-    } else {
-        Err(Error::Syntax(offset))
-    }
+    input
+        .parse::<core::net::Ipv4Addr>()
+        .map(|addr| addr.octets())
+        .map_err(|_| Error::Syntax(offset))
 }
 
 pub(super) fn parse_ipv6(input: &str, offset: usize) -> Result<[u8; 16], Error> {
-    if input.is_empty() {
-        return Err(Error::Syntax(offset));
-    }
-    let (left, right, compressed) = match input.split_once("::") {
-        Some((left, right)) => {
-            if right.contains("::") {
-                return Err(Error::Syntax(offset));
-            }
-            (left, right, true)
-        }
-        None => (input, "", false),
-    };
-
-    let mut groups = Vec::new();
-    parse_ipv6_side(left, !compressed && right.is_empty(), offset, &mut groups)?;
-    let left_len = groups.len();
-    if compressed {
-        let mut right_groups = Vec::new();
-        parse_ipv6_side(
-            right,
-            true,
-            offset + input.len() - right.len(),
-            &mut right_groups,
-        )?;
-        if left_len + right_groups.len() > 7 {
-            return Err(Error::Syntax(offset));
-        }
-        let zeroes = 8 - left_len - right_groups.len();
-        groups.extend(core::iter::repeat_n(0, zeroes));
-        groups.extend(right_groups);
-    }
-
-    if groups.len() != 8 {
-        return Err(Error::Syntax(offset));
-    }
-
-    let mut out = [0u8; 16];
-    for (idx, group) in groups.into_iter().enumerate() {
-        out[idx * 2..idx * 2 + 2].copy_from_slice(&group.to_be_bytes());
-    }
-    Ok(out)
-}
-
-fn parse_ipv6_side(
-    side: &str,
-    allow_ipv4_tail: bool,
-    offset: usize,
-    groups: &mut Vec<u16>,
-) -> Result<(), Error> {
-    if side.is_empty() {
-        return Ok(());
-    }
-    for (idx, part) in side.split(':').enumerate() {
-        if part.is_empty() {
-            return Err(Error::Syntax(offset));
-        }
-        if part.contains('.') {
-            if !allow_ipv4_tail || idx + 1 != side.split(':').count() {
-                return Err(Error::Syntax(offset));
-            }
-            let v4 = parse_ipv4(part, offset)?;
-            groups.push(u16::from_be_bytes([v4[0], v4[1]]));
-            groups.push(u16::from_be_bytes([v4[2], v4[3]]));
-            continue;
-        }
-        if part.len() > 4 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::Syntax(offset));
-        }
-        groups.push(u16::from_str_radix(part, 16).map_err(|_| Error::Syntax(offset))?);
-    }
-    Ok(())
+    input
+        .parse::<core::net::Ipv6Addr>()
+        .map(|addr| addr.octets())
+        .map_err(|_| Error::Syntax(offset))
 }
 
 fn mask_prefix(mut bytes: Vec<u8>, prefix: u8) -> Vec<u8> {

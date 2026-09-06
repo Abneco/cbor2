@@ -10,6 +10,43 @@ use serde::{de, ser};
 // protocol: only `RawValue` itself uses it.
 pub(crate) const NAME: &str = "@@RAW@@";
 
+pub(crate) const BORROWED_NAME: &str = "@@RAW_BORROWED@@";
+
+// Only used internally with the borrowing cbor2 source. Its capture path
+// validates structure and UTF-8 before handing out the exact source range.
+pub(crate) struct RawSlice<'a>(pub(crate) &'a [u8]);
+
+impl<'de> de::Deserialize<'de> for RawSlice<'de> {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Borrowed;
+        impl<'de> de::Visitor<'de> for Borrowed {
+            type Value = RawSlice<'de>;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a borrowed raw CBOR item")
+            }
+            fn visit_borrowed_bytes<E: de::Error>(
+                self,
+                bytes: &'de [u8],
+            ) -> Result<Self::Value, E> {
+                Ok(RawSlice(bytes))
+            }
+        }
+        deserializer.deserialize_newtype_struct(BORROWED_NAME, Borrowed)
+    }
+}
+
+impl ser::Serialize for RawSlice<'_> {
+    fn serialize<S: ser::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Bytes<'a>(&'a [u8]);
+        impl ser::Serialize for Bytes<'_> {
+            fn serialize<S: ser::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        serializer.serialize_newtype_struct(NAME, &Bytes(self.0))
+    }
+}
+
 /// A valid CBOR item, kept as its raw encoded bytes.
 ///
 /// Like [`serde_json::value::RawValue`](https://docs.rs/serde_json/latest/serde_json/value/struct.RawValue.html),
@@ -58,11 +95,11 @@ pub struct RawValue(Vec<u8>);
 impl RawValue {
     /// Wraps the encoding of exactly one well-formed CBOR item.
     ///
-    /// The bytes are checked with [`validate`](crate::validate); anything
+    /// The bytes are checked with [`validate_slice`](crate::validate_slice); anything
     /// else — malformed items, trailing data — is rejected, which keeps
     /// every `RawValue` safe to splice into an encoded stream.
     pub fn new(bytes: Vec<u8>) -> Result<Self, crate::de::Error> {
-        crate::validate(&bytes[..])?;
+        crate::validate_slice(&bytes)?;
         Ok(Self(bytes))
     }
 
@@ -183,16 +220,7 @@ impl core::fmt::Debug for RawValue {
 
 impl ser::Serialize for RawValue {
     fn serialize<S: ser::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        struct Bytes<'a>(&'a [u8]);
-
-        impl ser::Serialize for Bytes<'_> {
-            #[inline]
-            fn serialize<S: ser::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.serialize_bytes(self.0)
-            }
-        }
-
-        serializer.serialize_newtype_struct(NAME, &Bytes(&self.0))
+        RawSlice(&self.0).serialize(serializer)
     }
 }
 
@@ -260,31 +288,43 @@ impl ser::Error for NotRawBytes {
     }
 }
 
-pub(crate) struct RawBytesSerializer;
+pub(crate) struct RawBytesSerializer<F> {
+    pub(crate) write: F,
+}
+
+#[cfg(test)]
+fn bytes_serializer() -> RawBytesSerializer<impl FnOnce(&[u8]) -> Result<Vec<u8>, NotRawBytes>> {
+    RawBytesSerializer {
+        write: |bytes: &[u8]| Ok(bytes.to_vec()),
+    }
+}
 
 macro_rules! not_raw_bytes {
     ($($f:ident($($t:ty),*);)+) => {$(
-        fn $f(self, $(_: $t),*) -> Result<Vec<u8>, NotRawBytes> {
-            Err(NotRawBytes)
+        fn $f(self, $(_: $t),*) -> Result<T, E> {
+            Err(E::custom(NotRawBytes))
         }
     )+};
 }
 
-impl ser::Serializer for RawBytesSerializer {
-    type Ok = Vec<u8>;
-    type Error = NotRawBytes;
+impl<F, T, E: ser::Error> ser::Serializer for RawBytesSerializer<F>
+where
+    F: FnOnce(&[u8]) -> Result<T, E>,
+{
+    type Ok = T;
+    type Error = E;
 
-    type SerializeSeq = ser::Impossible<Vec<u8>, NotRawBytes>;
-    type SerializeTuple = ser::Impossible<Vec<u8>, NotRawBytes>;
-    type SerializeTupleStruct = ser::Impossible<Vec<u8>, NotRawBytes>;
-    type SerializeTupleVariant = ser::Impossible<Vec<u8>, NotRawBytes>;
-    type SerializeMap = ser::Impossible<Vec<u8>, NotRawBytes>;
-    type SerializeStruct = ser::Impossible<Vec<u8>, NotRawBytes>;
-    type SerializeStructVariant = ser::Impossible<Vec<u8>, NotRawBytes>;
+    type SerializeSeq = ser::Impossible<T, E>;
+    type SerializeTuple = ser::Impossible<T, E>;
+    type SerializeTupleStruct = ser::Impossible<T, E>;
+    type SerializeTupleVariant = ser::Impossible<T, E>;
+    type SerializeMap = ser::Impossible<T, E>;
+    type SerializeStruct = ser::Impossible<T, E>;
+    type SerializeStructVariant = ser::Impossible<T, E>;
 
     #[inline]
-    fn serialize_bytes(self, v: &[u8]) -> Result<Vec<u8>, NotRawBytes> {
-        Ok(v.to_vec())
+    fn serialize_bytes(self, v: &[u8]) -> Result<T, E> {
+        (self.write)(v)
     }
 
     not_raw_bytes! {
@@ -308,25 +348,20 @@ impl ser::Serializer for RawBytesSerializer {
         serialize_unit_struct(&'static str);
     }
 
-    fn serialize_unit_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-    ) -> Result<Vec<u8>, NotRawBytes> {
-        Err(NotRawBytes)
+    fn serialize_unit_variant(self, _: &'static str, _: u32, _: &'static str) -> Result<T, E> {
+        Err(E::custom(NotRawBytes))
     }
 
-    fn serialize_some<U: ?Sized + ser::Serialize>(self, _: &U) -> Result<Vec<u8>, NotRawBytes> {
-        Err(NotRawBytes)
+    fn serialize_some<U: ?Sized + ser::Serialize>(self, _: &U) -> Result<T, E> {
+        Err(E::custom(NotRawBytes))
     }
 
     fn serialize_newtype_struct<U: ?Sized + ser::Serialize>(
         self,
         _: &'static str,
         _: &U,
-    ) -> Result<Vec<u8>, NotRawBytes> {
-        Err(NotRawBytes)
+    ) -> Result<T, E> {
+        Err(E::custom(NotRawBytes))
     }
 
     fn serialize_newtype_variant<U: ?Sized + ser::Serialize>(
@@ -335,24 +370,24 @@ impl ser::Serializer for RawBytesSerializer {
         _: u32,
         _: &'static str,
         _: &U,
-    ) -> Result<Vec<u8>, NotRawBytes> {
-        Err(NotRawBytes)
+    ) -> Result<T, E> {
+        Err(E::custom(NotRawBytes))
     }
 
-    fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, NotRawBytes> {
-        Err(NotRawBytes)
+    fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, E> {
+        Err(E::custom(NotRawBytes))
     }
 
-    fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, NotRawBytes> {
-        Err(NotRawBytes)
+    fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, E> {
+        Err(E::custom(NotRawBytes))
     }
 
     fn serialize_tuple_struct(
         self,
         _: &'static str,
         _: usize,
-    ) -> Result<Self::SerializeTupleStruct, NotRawBytes> {
-        Err(NotRawBytes)
+    ) -> Result<Self::SerializeTupleStruct, E> {
+        Err(E::custom(NotRawBytes))
     }
 
     fn serialize_tuple_variant(
@@ -361,20 +396,16 @@ impl ser::Serializer for RawBytesSerializer {
         _: u32,
         _: &'static str,
         _: usize,
-    ) -> Result<Self::SerializeTupleVariant, NotRawBytes> {
-        Err(NotRawBytes)
+    ) -> Result<Self::SerializeTupleVariant, E> {
+        Err(E::custom(NotRawBytes))
     }
 
-    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, NotRawBytes> {
-        Err(NotRawBytes)
+    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, E> {
+        Err(E::custom(NotRawBytes))
     }
 
-    fn serialize_struct(
-        self,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeStruct, NotRawBytes> {
-        Err(NotRawBytes)
+    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self::SerializeStruct, E> {
+        Err(E::custom(NotRawBytes))
     }
 
     fn serialize_struct_variant(
@@ -383,8 +414,8 @@ impl ser::Serializer for RawBytesSerializer {
         _: u32,
         _: &'static str,
         _: usize,
-    ) -> Result<Self::SerializeStructVariant, NotRawBytes> {
-        Err(NotRawBytes)
+    ) -> Result<Self::SerializeStructVariant, E> {
+        Err(E::custom(NotRawBytes))
     }
 
     fn is_human_readable(&self) -> bool {
@@ -444,48 +475,48 @@ mod tests {
     #[test]
     fn raw_bytes_serializer_accepts_only_bytes() {
         assert_eq!(
-            RawBytesSerializer.serialize_bytes(b"\x01").unwrap(),
+            bytes_serializer().serialize_bytes(b"\x01").unwrap(),
             vec![0x01]
         );
-        assert!(!RawBytesSerializer.is_human_readable());
+        assert!(!bytes_serializer().is_human_readable());
 
-        assert!(RawBytesSerializer.serialize_bool(true).is_err());
-        assert!(RawBytesSerializer.serialize_i8(1).is_err());
-        assert!(RawBytesSerializer.serialize_i16(1).is_err());
-        assert!(RawBytesSerializer.serialize_i32(1).is_err());
-        assert!(RawBytesSerializer.serialize_i64(1).is_err());
-        assert!(RawBytesSerializer.serialize_i128(1).is_err());
-        assert!(RawBytesSerializer.serialize_u8(1).is_err());
-        assert!(RawBytesSerializer.serialize_u16(1).is_err());
-        assert!(RawBytesSerializer.serialize_u32(1).is_err());
-        assert!(RawBytesSerializer.serialize_u64(1).is_err());
-        assert!(RawBytesSerializer.serialize_u128(1).is_err());
-        assert!(RawBytesSerializer.serialize_f32(1.0).is_err());
-        assert!(RawBytesSerializer.serialize_f64(1.0).is_err());
-        assert!(RawBytesSerializer.serialize_char('a').is_err());
-        assert!(RawBytesSerializer.serialize_str("a").is_err());
-        assert!(RawBytesSerializer.serialize_none().is_err());
-        assert!(RawBytesSerializer.serialize_some(&1u8).is_err());
-        assert!(RawBytesSerializer.serialize_unit().is_err());
-        assert!(RawBytesSerializer.serialize_unit_struct("x").is_err());
-        assert!(RawBytesSerializer
+        assert!(bytes_serializer().serialize_bool(true).is_err());
+        assert!(bytes_serializer().serialize_i8(1).is_err());
+        assert!(bytes_serializer().serialize_i16(1).is_err());
+        assert!(bytes_serializer().serialize_i32(1).is_err());
+        assert!(bytes_serializer().serialize_i64(1).is_err());
+        assert!(bytes_serializer().serialize_i128(1).is_err());
+        assert!(bytes_serializer().serialize_u8(1).is_err());
+        assert!(bytes_serializer().serialize_u16(1).is_err());
+        assert!(bytes_serializer().serialize_u32(1).is_err());
+        assert!(bytes_serializer().serialize_u64(1).is_err());
+        assert!(bytes_serializer().serialize_u128(1).is_err());
+        assert!(bytes_serializer().serialize_f32(1.0).is_err());
+        assert!(bytes_serializer().serialize_f64(1.0).is_err());
+        assert!(bytes_serializer().serialize_char('a').is_err());
+        assert!(bytes_serializer().serialize_str("a").is_err());
+        assert!(bytes_serializer().serialize_none().is_err());
+        assert!(bytes_serializer().serialize_some(&1u8).is_err());
+        assert!(bytes_serializer().serialize_unit().is_err());
+        assert!(bytes_serializer().serialize_unit_struct("x").is_err());
+        assert!(bytes_serializer()
             .serialize_unit_variant("x", 0, "y")
             .is_err());
-        assert!(RawBytesSerializer
+        assert!(bytes_serializer()
             .serialize_newtype_struct("x", &1u8)
             .is_err());
-        assert!(RawBytesSerializer
+        assert!(bytes_serializer()
             .serialize_newtype_variant("x", 0, "y", &1u8)
             .is_err());
-        assert!(RawBytesSerializer.serialize_seq(None).is_err());
-        assert!(RawBytesSerializer.serialize_tuple(0).is_err());
-        assert!(RawBytesSerializer.serialize_tuple_struct("x", 0).is_err());
-        assert!(RawBytesSerializer
+        assert!(bytes_serializer().serialize_seq(None).is_err());
+        assert!(bytes_serializer().serialize_tuple(0).is_err());
+        assert!(bytes_serializer().serialize_tuple_struct("x", 0).is_err());
+        assert!(bytes_serializer()
             .serialize_tuple_variant("x", 0, "y", 0)
             .is_err());
-        assert!(RawBytesSerializer.serialize_map(None).is_err());
-        assert!(RawBytesSerializer.serialize_struct("x", 0).is_err());
-        assert!(RawBytesSerializer
+        assert!(bytes_serializer().serialize_map(None).is_err());
+        assert!(bytes_serializer().serialize_struct("x", 0).is_err());
+        assert!(bytes_serializer()
             .serialize_struct_variant("x", 0, "y", 0)
             .is_err());
     }

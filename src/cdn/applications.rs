@@ -8,23 +8,6 @@ use super::encode::{
 };
 use super::types::{Arg, Atom, ElidedStringPart, Indicator, ELLIPSIS_TAG, UNRESOLVED_APP_TAG};
 
-pub(super) fn unresolved_app_string(
-    prefix: &str,
-    content: String,
-    offset: usize,
-) -> Result<Atom, Error> {
-    let mut out = Vec::new();
-    write_tag(&mut out, UNRESOLVED_APP_TAG)?;
-    write_array_len(&mut out, 2)?;
-    write_definite_text(&mut out, prefix, Indicator::None)?;
-    write_array_len(&mut out, 1)?;
-    write_definite_text(&mut out, &content, Indicator::None)?;
-    if out.is_empty() {
-        return Err(Error::Syntax(offset));
-    }
-    Ok(Atom::Raw(out))
-}
-
 pub(super) fn unresolved_app_sequence(
     prefix: &str,
     args: Vec<Arg>,
@@ -36,7 +19,7 @@ pub(super) fn unresolved_app_sequence(
     write_definite_text(&mut out, prefix, Indicator::None)?;
     write_array_len(&mut out, args.len())?;
     for arg in args {
-        out.extend_from_slice(&arg.encoded);
+        out.extend_from_slice(&arg.into_encoded()?);
     }
     if out.is_empty() {
         return Err(Error::Syntax(offset));
@@ -62,109 +45,101 @@ pub(super) fn concat_app_strings(
     args: Vec<Arg>,
     offset: usize,
 ) -> Result<Atom, Error> {
-    let want_text = prefix == "t1";
-    let mut complete = Vec::new();
-    let mut parts = Vec::new();
-    let mut saw_elision = false;
-
+    let mut concat = StringConcat {
+        text: prefix == "t1",
+        bytes: Vec::new(),
+        parts: Vec::new(),
+        elided: false,
+    };
     for arg in args {
-        collect_string_arg(
-            prefix,
-            arg.value,
-            want_text,
-            offset,
-            &mut complete,
-            &mut parts,
-            &mut saw_elision,
-        )?;
+        concat.collect(arg.into_value()?, offset)?;
     }
-
-    if !saw_elision {
-        if want_text {
-            return String::from_utf8(complete)
+    if !concat.elided {
+        return if concat.text {
+            String::from_utf8(concat.bytes)
                 .map(Atom::Text)
-                .map_err(|_| Error::semantic(offset, "t1 result is not UTF-8"));
-        }
-        return Ok(Atom::Bytes(complete));
+                .map_err(|_| Error::semantic(offset, "t1 result is not UTF-8"))
+        } else {
+            Ok(Atom::Bytes(concat.bytes))
+        };
     }
-
-    if parts
+    concat.flush(offset)?;
+    if concat
+        .parts
         .iter()
         .all(|part| matches!(part, ElidedStringPart::Ellipsis))
     {
         return Ok(Atom::Raw(ellipsis_item()));
     }
-
     let mut out = Vec::new();
-    write_elided_string(&mut out, &parts)?;
+    write_elided_string(&mut out, &concat.parts)?;
     Ok(Atom::Raw(out))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_string_arg(
-    prefix: &str,
-    value: Value,
-    want_text: bool,
-    offset: usize,
-    complete: &mut Vec<u8>,
-    parts: &mut Vec<ElidedStringPart>,
-    saw_elision: &mut bool,
-) -> Result<(), Error> {
-    match value {
-        Value::Text(text) => {
-            if *saw_elision {
-                if want_text {
-                    push_elided_part(parts, ElidedStringPart::Text(text));
-                } else {
-                    push_elided_part(parts, ElidedStringPart::Bytes(text.into_bytes()));
-                }
-            } else {
-                complete.extend_from_slice(text.as_bytes());
-            }
+struct StringConcat {
+    text: bool,
+    bytes: Vec<u8>,
+    parts: Vec<ElidedStringPart>,
+    elided: bool,
+}
+
+impl StringConcat {
+    fn flush(&mut self, offset: usize) -> Result<(), Error> {
+        if self.bytes.is_empty() {
+            return Ok(());
         }
-        Value::Bytes(bytes) => {
-            if *saw_elision {
-                if want_text {
-                    let text = String::from_utf8(bytes)
-                        .map_err(|_| Error::semantic(offset, "t1 argument is not UTF-8"))?;
-                    push_elided_part(parts, ElidedStringPart::Text(text));
-                } else {
-                    push_elided_part(parts, ElidedStringPart::Bytes(bytes));
-                }
-            } else {
-                complete.extend_from_slice(&bytes);
-            }
-        }
-        Value::Tag(ELLIPSIS_TAG, inner) => {
-            if !*saw_elision {
-                *saw_elision = true;
-                if !complete.is_empty() {
-                    if want_text {
-                        let text = String::from_utf8(core::mem::take(complete))
-                            .map_err(|_| Error::semantic(offset, "t1 result is not UTF-8"))?;
-                        push_elided_part(parts, ElidedStringPart::Text(text));
-                    } else {
-                        push_elided_part(parts, ElidedStringPart::Bytes(core::mem::take(complete)));
+        let bytes = core::mem::take(&mut self.bytes);
+        let part = if self.text {
+            ElidedStringPart::Text(
+                String::from_utf8(bytes)
+                    .map_err(|_| Error::semantic(offset, "t1 span is not UTF-8"))?,
+            )
+        } else {
+            ElidedStringPart::Bytes(bytes)
+        };
+        push_elided_part(&mut self.parts, part);
+        Ok(())
+    }
+    fn collect(&mut self, value: Value, offset: usize) -> Result<(), Error> {
+        match value {
+            Value::Text(text) => self.bytes.extend_from_slice(text.as_bytes()),
+            Value::Bytes(bytes) => self.bytes.extend_from_slice(&bytes),
+            Value::Tag(ELLIPSIS_TAG, inner) => {
+                self.elided = true;
+                match *inner {
+                    Value::Null => {
+                        self.flush(offset)?;
+                        push_elided_part(&mut self.parts, ElidedStringPart::Ellipsis);
+                    }
+                    Value::Array(items) => {
+                        for item in items {
+                            self.collect(item, offset)?;
+                        }
+                    }
+                    _ => {
+                        return Err(Error::semantic(
+                            offset,
+                            "ellipsis must contain null or string parts",
+                        ))
                     }
                 }
             }
-            flatten_elision_value(prefix, *inner, want_text, offset, parts)?;
+            _ => {
+                return Err(Error::semantic(
+                    offset,
+                    "concatenation arguments must be strings or ellipses",
+                ))
+            }
         }
-        _ => {
-            return Err(Error::semantic(
-                offset,
-                format!("{prefix} arguments must be strings"),
-            ));
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(super) fn concat_bytes(args: Vec<Arg>, offset: usize) -> Result<Atom, Error> {
     let mut out = Vec::new();
 
     for arg in args {
-        match arg.value {
+        match arg.into_value()? {
             Value::Text(text) => out.extend_from_slice(text.as_bytes()),
             Value::Bytes(bytes) => out.extend_from_slice(&bytes),
             _ => return Err(Error::semantic(offset, "bytes arguments must be strings")),
@@ -183,95 +158,70 @@ pub(super) fn same_args(args: Vec<Arg>, offset: usize) -> Result<Atom, Error> {
         ));
     };
 
+    let encoded = first.into_encoded()?;
+    let first = crate::de::value_from_slice(&encoded)?;
     for arg in args {
-        if !values_same(&first.value, &arg.value) {
+        if !values_same(&first, &arg.into_value()?) {
             return Err(Error::semantic(offset, "same arguments are not equal"));
         }
     }
 
     // `same` checks data model equality but preserves the first spelling.
-    Ok(Atom::Raw(first.encoded))
+    Ok(Atom::Raw(encoded))
 }
 
 fn values_same(left: &Value, right: &Value) -> bool {
+    values_equal(left, right, false)
+}
+
+fn values_equal(left: &Value, right: &Value, key: bool) -> bool {
     match (left, right) {
         (Value::Integer(left), Value::Integer(right)) => left == right,
         (Value::Bytes(left), Value::Bytes(right)) => left == right,
-        (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+        (Value::Float(left), Value::Float(right)) => {
+            if key {
+                left == right
+                    || (left.is_nan()
+                        && right.is_nan()
+                        && (left.to_bits() & 0x000f_ffff_ffff_ffff)
+                            == (right.to_bits() & 0x000f_ffff_ffff_ffff))
+            } else {
+                left.to_bits() == right.to_bits()
+            }
+        }
         (Value::Text(left), Value::Text(right)) => left == right,
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Null, Value::Null) => true,
         (Value::Tag(left_tag, left), Value::Tag(right_tag, right)) => {
-            left_tag == right_tag && values_same(left, right)
+            left_tag == right_tag && values_equal(left, right, key)
         }
         (Value::Array(left), Value::Array(right)) => {
             left.len() == right.len()
                 && left
                     .iter()
                     .zip(right.iter())
-                    .all(|(left, right)| values_same(left, right))
+                    .all(|(left, right)| values_equal(left, right, key))
         }
         (Value::Map(left), Value::Map(right)) => {
-            left.len() == right.len()
-                && left.iter().zip(right.iter()).all(
-                    |((left_key, left_value), (right_key, right_value))| {
-                        values_same(left_key, right_key) && values_same(left_value, right_value)
-                    },
-                )
+            if left.len() != right.len() {
+                return false;
+            }
+            let mut matched = alloc::vec![false; right.len()];
+            left.iter().all(|(left_key, value)| {
+                let found = right.iter().enumerate().position(|(i, (k, v))| {
+                    !matched[i] && values_equal(left_key, k, true) && values_equal(value, v, key)
+                });
+                if let Some(i) = found {
+                    matched[i] = true;
+                    true
+                } else {
+                    false
+                }
+            })
         }
         (Value::Simple(left), Value::Simple(right)) => left == right,
         _ => false,
     }
-}
-
-fn flatten_elision_value(
-    prefix: &str,
-    value: Value,
-    want_text: bool,
-    offset: usize,
-    parts: &mut Vec<ElidedStringPart>,
-) -> Result<(), Error> {
-    match value {
-        Value::Null => {
-            push_elided_part(parts, ElidedStringPart::Ellipsis);
-        }
-        Value::Array(items) => {
-            for item in items {
-                match item {
-                    Value::Text(text) if want_text => {
-                        push_elided_part(parts, ElidedStringPart::Text(text));
-                    }
-                    Value::Text(text) => {
-                        push_elided_part(parts, ElidedStringPart::Bytes(text.into_bytes()));
-                    }
-                    Value::Bytes(bytes) if want_text => {
-                        let text = String::from_utf8(bytes)
-                            .map_err(|_| Error::semantic(offset, "t1 argument is not UTF-8"))?;
-                        push_elided_part(parts, ElidedStringPart::Text(text));
-                    }
-                    Value::Bytes(bytes) => {
-                        push_elided_part(parts, ElidedStringPart::Bytes(bytes));
-                    }
-                    Value::Tag(ELLIPSIS_TAG, inner) => {
-                        flatten_elision_value(prefix, *inner, want_text, offset, parts)?;
-                    }
-                    _ => {
-                        return Err(Error::semantic(
-                            offset,
-                            format!("{prefix} ellipsis parts must be strings"),
-                        ));
-                    }
-                }
-            }
-        }
-        _ => {
-            return Err(Error::semantic(
-                offset,
-                format!("{prefix} ellipsis must contain null or string parts"),
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn hex_atom(content: &str, offset: usize) -> Result<Atom, Error> {
@@ -511,7 +461,8 @@ pub(super) fn append_indefinite_string_chunk(
     arg: Arg,
     offset: usize,
 ) -> Result<(), Error> {
-    let Some(&head) = arg.encoded.first() else {
+    let encoded = arg.into_encoded()?;
+    let Some(&head) = encoded.first() else {
         return Err(Error::Syntax(offset));
     };
     let source_major = head >> 5;
@@ -523,17 +474,17 @@ pub(super) fn append_indefinite_string_chunk(
     }
 
     if want_major == 3 {
-        match &arg.value {
+        match crate::de::value_from_slice(&encoded)? {
             Value::Text(..) => {}
             Value::Bytes(bytes) => {
-                core::str::from_utf8(bytes)
+                core::str::from_utf8(&bytes)
                     .map_err(|_| Error::semantic(offset, "ilts argument is not UTF-8"))?;
             }
             _ => unreachable!("string major type decoded as non-string value"),
         }
     }
 
-    let mut encoded = arg.encoded;
+    let mut encoded = encoded;
     encoded[0] = (want_major << 5) | (head & 0x1f);
     out.extend_from_slice(&encoded);
     Ok(())
@@ -557,7 +508,7 @@ pub(super) fn one_text_arg(prefix: &str, args: Vec<Arg>, offset: usize) -> Resul
             format!("{prefix} expects exactly one argument"),
         ));
     }
-    match args.into_iter().next().unwrap().value {
+    match args.into_iter().next().unwrap().into_value()? {
         Value::Text(s) => Ok(s),
         Value::Bytes(b) => String::from_utf8(b)
             .map_err(|_| Error::semantic(offset, format!("{prefix} argument is not UTF-8"))),
@@ -575,8 +526,8 @@ pub(super) fn one_bytes_arg(prefix: &str, args: Vec<Arg>, offset: usize) -> Resu
             format!("{prefix} expects exactly one argument"),
         ));
     }
-    match args.into_iter().next().unwrap().value {
-        Value::Text(s) => Ok(s.into_bytes()),
+    match args.into_iter().next().unwrap().into_value()? {
+        Value::Text(s) => hex_content(&s, offset),
         Value::Bytes(b) => Ok(b),
         _ => Err(Error::semantic(
             offset,

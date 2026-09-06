@@ -91,6 +91,10 @@ struct Claims {
 
 完整的 COSE 示例请参阅 [`cbor2` 主 README](https://github.com/ldclabs/cbor2#integer-map-keys-and-tags-cose-with-derivecbor)。
 
+启用 `cbor2` 的 `derive` 即可使用宏，无需额外 serde 依赖。支持容器默认值和递归 `Self` 类型。位置数组禁止条件省略或单向跳过字段；应使用 `Option` 占位或双向 `#[serde(skip)]`。
+
+flatten 结构体中已声明的 RawValue 字段保留原始编码，切片解码支持借用字段。二进制 flatten 适配器使用 cbor2 的原始条目协议，不支持其他二进制序列化器；可读格式仍使用普通 serde 表示。
+
 ## 许可协议
 
 采用 MIT 许可协议。

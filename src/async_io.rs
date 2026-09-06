@@ -30,7 +30,7 @@ use core::future::Future;
 
 use serde::{de, ser};
 
-use crate::core::{f16_to_f64, Header};
+use crate::core::Header;
 use crate::de::{Error, DEFAULT_RECURSION_LIMIT};
 
 const CHUNK: usize = 4096;
@@ -397,7 +397,7 @@ where
 /// The bytes are validated before writing so a caller cannot accidentally
 /// send a partial item or a CBOR sequence through this exact-one-item helper.
 pub async fn write_item<W: AsyncWrite + ?Sized>(writer: &mut W, item: &[u8]) -> Result<(), Error> {
-    crate::validate(item)?;
+    crate::validate_slice(item)?;
     writer.write_all(item).await.map_err(Error::Io)?;
     writer.flush().await.map_err(Error::Io)
 }
@@ -414,42 +414,6 @@ where
         .await
         .map_err(crate::ser::Error::Io)?;
     writer.flush().await.map_err(crate::ser::Error::Io)
-}
-
-#[derive(Copy, Clone)]
-enum Arg {
-    This(u8),
-    Next1(u8),
-    Next2(u16),
-    Next4(u32),
-    Next8(u64),
-    Indefinite,
-}
-
-fn int_arg(arg: Arg) -> Option<u64> {
-    match arg {
-        Arg::This(x) => Some(x as u64),
-        Arg::Next1(x) => Some(x as u64),
-        Arg::Next2(x) => Some(x as u64),
-        Arg::Next4(x) => Some(x as u64),
-        Arg::Next8(x) => Some(x),
-        Arg::Indefinite => None,
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-fn len_arg(arg: Arg, _start: usize) -> Result<Option<usize>, Error> {
-    Ok(int_arg(arg).map(|x| x as usize))
-}
-
-#[cfg(not(target_pointer_width = "64"))]
-fn len_arg(arg: Arg, start: usize) -> Result<Option<usize>, Error> {
-    match int_arg(arg) {
-        Some(x) => usize::try_from(x)
-            .map(Some)
-            .map_err(|_| Error::Syntax(start)),
-        None => Ok(None),
-    }
 }
 
 async fn read_exact_record<R: AsyncRead + ?Sized>(
@@ -482,56 +446,30 @@ async fn pull_header<R: AsyncRead + ?Sized>(
     max_len: Option<usize>,
 ) -> Result<(Header, usize), Error> {
     let start = *offset;
-    let mut prefix = [0u8; 1];
-    read_exact_record(reader, out, offset, &mut prefix, max_len).await?;
-
-    let major = prefix[0] >> 5;
-    let minor = prefix[0] & 0b00011111;
-
-    let arg = match minor {
-        x @ 0..=23 => Arg::This(x),
-        24 => {
-            let mut b = [0u8; 1];
-            read_exact_record(reader, out, offset, &mut b, max_len).await?;
-            Arg::Next1(b[0])
-        }
-        25 => {
-            let mut b = [0u8; 2];
-            read_exact_record(reader, out, offset, &mut b, max_len).await?;
-            Arg::Next2(u16::from_be_bytes(b))
-        }
-        26 => {
-            let mut b = [0u8; 4];
-            read_exact_record(reader, out, offset, &mut b, max_len).await?;
-            Arg::Next4(u32::from_be_bytes(b))
-        }
-        27 => {
-            let mut b = [0u8; 8];
-            read_exact_record(reader, out, offset, &mut b, max_len).await?;
-            Arg::Next8(u64::from_be_bytes(b))
-        }
-        31 => Arg::Indefinite,
+    let mut raw = [0u8; 9];
+    read_exact_record(reader, out, offset, &mut raw[..1], max_len).await?;
+    let minor = raw[0] & 31;
+    let width = match minor {
+        0..=23 | 31 => 0,
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
         _ => return Err(Error::Syntax(start)),
     };
-
-    let header = match major {
-        0 => Header::Positive(int_arg(arg).ok_or(Error::Syntax(start))?),
-        1 => Header::Negative(int_arg(arg).ok_or(Error::Syntax(start))?),
-        2 => Header::Bytes(len_arg(arg, start)?),
-        3 => Header::Text(len_arg(arg, start)?),
-        4 => Header::Array(len_arg(arg, start)?),
-        5 => Header::Map(len_arg(arg, start)?),
-        6 => Header::Tag(int_arg(arg).ok_or(Error::Syntax(start))?),
-        _ => match arg {
-            Arg::This(x) => Header::Simple(x),
-            Arg::Next1(x) if x >= 32 => Header::Simple(x),
-            Arg::Next1(..) => return Err(Error::Syntax(start)),
-            Arg::Next2(x) => Header::Float(f16_to_f64(x)),
-            Arg::Next4(x) => Header::Float(f32::from_bits(x) as f64),
-            Arg::Next8(x) => Header::Float(f64::from_bits(x)),
-            Arg::Indefinite => Header::Break,
-        },
+    if width != 0 {
+        read_exact_record(reader, out, offset, &mut raw[1..1 + width], max_len).await?;
+    }
+    let arg = match minor {
+        0..=23 => Some(u64::from(minor)),
+        31 => None,
+        _ => Some(
+            raw[1..1 + width]
+                .iter()
+                .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)),
+        ),
     };
+    let header = crate::core::decode_header(&raw, arg, start)?;
 
     Ok((header, start))
 }
@@ -543,6 +481,7 @@ async fn read_body<R: AsyncRead + ?Sized>(
     mut remaining: usize,
     max_len: Option<usize>,
 ) -> Result<(), Error> {
+    check_size_limit(*offset, remaining, max_len)?;
     // Grow `out` chunk by chunk and read straight into it: memory still
     // only grows as data actually arrives, without staging each chunk
     // through a separate buffer first.
@@ -634,6 +573,12 @@ async fn read_item_inner<R: AsyncRead + ?Sized>(
             }
         }
 
+        // A container at the final permitted level can still be empty.
+        // Its terminating break is accepted above, but another child is not.
+        if stack.len() > limit {
+            return Err(Error::RecursionLimitExceeded);
+        }
+
         // Count this item against the current frame.
         match stack.last_mut().expect("non-empty") {
             Frame::Array(n) => *n -= 1,
@@ -682,7 +627,7 @@ async fn read_item_inner<R: AsyncRead + ?Sized>(
 
 // Pushes a nested container, enforcing the recursion limit on nesting depth.
 fn push(stack: &mut Vec<Frame>, frame: Frame, limit: usize) -> Result<(), Error> {
-    if stack.len() >= limit {
+    if stack.len() > limit {
         return Err(Error::RecursionLimitExceeded);
     }
     stack.push(frame);

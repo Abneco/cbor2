@@ -14,6 +14,7 @@ mod de;
 mod integer;
 mod ser;
 
+pub(crate) use canonical::to_writer as canonical_to_writer;
 pub use canonical::KeyOrder;
 pub use integer::Integer;
 
@@ -435,7 +436,6 @@ implfrom! {
     Bytes(&[u8]),
 
     Float(f64),
-    Float(f32),
 
     Text(String),
     Text(&str),
@@ -448,6 +448,12 @@ implfrom! {
 
     Map(&[(Value, Value)]),
     Map(Vec<(Value, Value)>),
+}
+
+impl From<f32> for Value {
+    fn from(value: f32) -> Self {
+        Self::Float(crate::core::f32_to_f64(value.to_bits()))
+    }
 }
 
 impl From<u128> for Value {

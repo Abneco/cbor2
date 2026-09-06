@@ -9,12 +9,14 @@ CBOR examples.
 The default build (`cbor2 = "1"`) is `std` and already covers `to_vec`,
 `to_writer`, `from_slice`, `from_reader`, `validate`, `validate_slice`,
 `Value`, `Simple`, `RawValue`, `cbor!`, the canonical encoders, diagnostics
-and the synchronous `async_io` helpers. Add a feature only for the rows that
+and the runtime-neutral `async_io` helpers. Add a feature only for the rows that
 need one:
 
 | Need | Manifest line |
 | --- | --- |
 | `#[derive(cbor2::Cbor)]` | `cbor2 = { version = "1", features = ["derive"] }` |
+| CDN hash literals with `no_std` + heap | `cbor2 = { version = "1", default-features = false, features = ["cdn-hash"] }` |
+| All CDN extensions (requires `std`) | `cbor2 = { version = "1", features = ["cdn"] }` |
 | tokio async adapters | `cbor2 = { version = "1", features = ["tokio"] }` |
 | futures async adapters | `cbor2 = { version = "1", features = ["futures"] }` |
 | `no_std` + heap | `cbor2 = { version = "1", default-features = false, features = ["alloc"] }` |
@@ -82,7 +84,14 @@ when it is intended to be CDN.
 - `#[cbor(key = 1)]` creates an integer map key. `#[serde(rename = "1")]`
   creates the text key `"1"`.
 - `#[cbor(array)]` is for named structs whose CBOR wire shape is a field-order
-  array. Do not combine it with per-field `#[cbor(key = ...)]`.
+  array. Do not combine it with per-field `#[cbor(key = ...)]`. Conditional or
+  one-directional skipping is rejected for positional fields; use `Option`
+  placeholders or symmetric `#[serde(skip)]`.
+- The Cbor derive resolves serde through cbor2; a direct serde dependency is
+  only needed when the caller itself uses serde APIs or derives.
+- For untrusted CDN text, use `cdn_to_vec_with_limit` or
+  `cdn_sequence_to_vec_with_limit` with an application-appropriate source-byte
+  limit before expensive arbitrary-precision decimal conversion.
 - `#[cbor(tag = N)]` wraps the container in CBOR tag `N` on encode and treats
   tag layers as transparent on decode, so the same type accepts tagged *or*
   untagged input — no separate "bare" struct plus a `From` impl.

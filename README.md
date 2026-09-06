@@ -217,7 +217,8 @@ CBOR sequences and canonical encoding.
   input covers comments, base-encoded byte strings, embedded CBOR sequences,
   encoding indicators, tags, simple values and CDN application extensions such
   as `dt`/`DT`, `ip`/`IP`, `b1`/`t1`, `ilbs`/`ilts`, `bytes`, `same` and
-  `float`; enable the `cdn` feature for `hash`, `cri` and `CRI`.
+  `float`; enable `cdn` for `hash`, `cri` and `CRI` (requires `std`),
+  or `cdn-hash` for hash literals on `no_std + alloc` targets.
   `bytes<<"ä", h'2f'>>` produces `h'c3a42f'`, while
   `same<< float'47110815', 0x1.22102ap+15 >>` checks alternate spellings of
   the same item and emits the first one. `Value` implements `Display` with
@@ -246,7 +247,9 @@ CBOR sequences and canonical encoding.
 | --------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `std`     | yes             | Implements the `cbor2::io` traits for every `std::io::Read`/`Write`, adds `async_io`, and adds the `HashMap` conversions. Implies `alloc`.           |
 | `alloc`   | yes (via `std`) | Everything needing a heap: `Value`, `to_vec`/`from_slice`/`from_reader`, `RawValue`, `diagnostic`, the deterministic encoders and the `cbor!` macro. |
-| `cdn`     | no              | Adds the CDN input extensions that need external crates: `hash`, `cri` and `CRI`. Implies `alloc`.                                                |
+| `cdn`     | no              | Enables `cdn-hash` and `cdn-cri`: `hash`, `cri` and `CRI`. Requires `std`.                                                |
+| `cdn-hash` | no | Hash extension literals; works with `no_std + alloc`. |
+| `cdn-cri` | no | CRI extension literals; requires `std` through the IRI parser. |
 | `derive`  | no              | The `#[derive(cbor2::Cbor)]` macro.                                                                                                                  |
 | `futures` | no              | Adds `async_io::futures` helpers for `futures_io::AsyncRead`/`AsyncWrite`. Implies `std`.                                                            |
 | `tokio`   | no              | Adds `async_io::tokio` helpers for `tokio::io::AsyncRead`/`AsyncWrite`. Implies `std`.                                                               |
@@ -347,9 +350,15 @@ annotated `#[cbor(key = ...)]` use integer map keys and the container is
 wrapped in a CBOR tag (`#[cbor(tag = ...)]`) on encode. Tag layers are
 transparent on decode, so the same type handles a protocol that travels both
 tagged and untagged, instead of a second "bare" struct and a `From` impl.
+The derive resolves serde through cbor2, so it needs no separate serde
+dependency unless your own code uses serde APIs or derives. Container defaults
+and recursive `Self` fields are supported.
+
 Named structs can also use `#[cbor(array)]` to encode as a compact field-order
-CBOR array while keeping Rust field names for JSON and code. Field names and
-the type name stay untouched, so the same types still serialize to plain JSON.
+CBOR array while keeping Rust field names for JSON and code. Conditional or
+one-directional field skipping is rejected for positional arrays: use an
+`Option` placeholder, or `#[serde(skip)]` to omit a field in both directions.
+Field names and the type name stay untouched, so the same types still serialize to plain JSON.
 
 ```toml
 [dependencies]
@@ -702,16 +711,22 @@ $ cbor validate a2646e616d65676578616d706c65626f6bf5
 valid
 ```
 
+### Bounded diagnostic input
+
+For untrusted CDN text, use `cdn_to_vec_with_limit(text, max_source_bytes)`
+or `cdn_sequence_to_vec_with_limit`. The limit is applied before normalization
+and parsing. Binary, octal and hexadecimal integers are parsed in linear time;
+arbitrary-size decimal conversion still needs a source-size budget. The
+unbounded helpers remain available for trusted documents.
+
 ## Testing
 
-`cargo test` runs the unit tests, a single integration-test binary and the
+`cargo test` runs unit tests, integration and allocation-contract tests, and
 doc tests — including the RFC 8949 Appendix A vectors and fault-injection
 tests for I/O failures and malformed input. CI builds and tests every
 feature combination, down to a bare-metal `no_std` target. Coverage
-measured with `cargo llvm-cov` is 100% of functions and about 98% of
-lines; the only never-executed lines are defensive branches that cannot
-occur, such as error paths that the `RawValue` validity invariant rules
-out.
+can be measured for the current source with `cargo llvm-cov`. Passing tests
+does not establish correctness for every possible input.
 
 ## Minimum supported Rust version
 

@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{format, string::String, vec::Vec};
 
 use crate::de::Error;
 
@@ -9,7 +9,7 @@ use super::types::{Atom, BigInt, Indicator};
 pub(super) fn datetime_atom(content: &str, tagged: bool, offset: usize) -> Result<Atom, Error> {
     let (seconds, fractional) = parse_datetime(content, offset)?;
     let atom = if let Some(frac) = fractional {
-        Atom::Float(seconds as f64 + frac)
+        Atom::Float(epoch_float(seconds, frac, offset)?)
     } else {
         Atom::Integer(BigInt::from_i128(seconds))
     };
@@ -25,7 +25,31 @@ pub(super) fn datetime_atom(content: &str, tagged: bool, offset: usize) -> Resul
     Ok(Atom::Raw(out))
 }
 
-fn parse_datetime(content: &str, offset: usize) -> Result<(i128, Option<f64>), Error> {
+// Convert the complete decimal epoch once, avoiding double rounding at zero
+// and when the fractional part is added to a large or negative whole second.
+fn epoch_float(seconds: i128, fraction: &str, offset: usize) -> Result<f64, Error> {
+    let decimal = if seconds >= 0 || fraction.bytes().all(|b| b == b'0') {
+        format!("{seconds}.{fraction}")
+    } else {
+        let mut complement: Vec<u8> = fraction.bytes().map(|b| b'9' - (b - b'0')).collect();
+        for digit in complement.iter_mut().rev() {
+            if *digit == b'9' {
+                *digit = b'0';
+            } else {
+                *digit += 1;
+                break;
+            }
+        }
+        format!(
+            "-{}.{}",
+            seconds.unsigned_abs() - 1,
+            String::from_utf8(complement).expect("decimal digits")
+        )
+    };
+    decimal.parse().map_err(|_| Error::Syntax(offset))
+}
+
+fn parse_datetime(content: &str, offset: usize) -> Result<(i128, Option<&str>), Error> {
     let b = content.as_bytes();
     if b.len() < 20 {
         return Err(Error::Syntax(offset));
@@ -52,13 +76,7 @@ fn parse_datetime(content: &str, offset: usize) -> Result<(i128, Option<f64>), E
         if pos == start {
             return Err(Error::Syntax(offset + pos));
         }
-        let mut frac = 0.0;
-        let mut scale = 1.0;
-        for &digit in &b[start..pos] {
-            scale *= 10.0;
-            frac += f64::from(digit - b'0') / scale;
-        }
-        Some(frac)
+        Some(&content[start..pos])
     } else {
         None
     };

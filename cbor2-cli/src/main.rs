@@ -19,7 +19,6 @@
 //! ```
 
 use std::env;
-use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::Path;
@@ -272,15 +271,7 @@ type Error = Box<dyn std::error::Error>;
 // details: indefinite-length `_` markers, `undefined`, unassigned simple
 // values and bignums as plain integers.
 fn show(input: Box<dyn Read>) -> Result<(), Error> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-
-    for item in cbor2::de::Deserializer::from_reader(input).into_iter::<RawValue>() {
-        let diag = cbor2::to_cdn_pretty(item?.as_ref())?;
-        writeln!(stdout, "{diag}")?;
-    }
-
-    Ok(stdout.flush()?)
+    decode(input, DecodeOutput::Diag)
 }
 
 // Decodes each CBOR item and pretty-prints it as diagnostic notation or, with
@@ -312,7 +303,7 @@ fn decode(input: Box<dyn Read>, output: DecodeOutput) -> Result<(), Error> {
 // check because the rest of the CLI accepts CBOR sequences item by item.
 fn validate(input: Box<dyn Read>) -> Result<(), Error> {
     let mut count = 0usize;
-    for item in cbor2::de::Deserializer::from_reader(input).into_iter::<RawValue>() {
+    for item in cbor2::de::Deserializer::from_reader(input).into_iter::<serde::de::IgnoredAny>() {
         item?;
         count += 1;
     }
@@ -415,7 +406,9 @@ fn to_json(value: Value) -> serde_json::Value {
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        let _ = write!(out, "{b:02x}");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(char::from(HEX[(b >> 4) as usize]));
+        out.push(char::from(HEX[(b & 15) as usize]));
     }
     out
 }

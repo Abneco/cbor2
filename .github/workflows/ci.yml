@@ -24,6 +24,8 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo build --workspace --all-targets --all-features
       - run: cargo test --workspace --all-targets --all-features
+      - run: cargo test --workspace --all-features --doc
+      - run: cargo test -p cbor2 --release --all-features --test it audit_regressions
 
   feature-tests:
     name: feature tests (${{ matrix.name }})
@@ -36,6 +38,10 @@ jobs:
             command: cargo test -p cbor2 --all-targets
           - name: derive
             command: cargo test -p cbor2 --all-targets --features derive
+          - name: cdn-hash
+            command: cargo test -p cbor2 --all-targets --features cdn-hash
+          - name: cdn-cri
+            command: cargo test -p cbor2 --all-targets --features cdn-cri
           - name: cdn
             command: cargo test -p cbor2 --all-targets --features cdn
           - name: futures
@@ -64,6 +70,8 @@ jobs:
             feature_args: "--features alloc"
           - name: alloc,derive
             feature_args: "--features alloc,derive"
+          - name: cdn-hash,derive
+            feature_args: "--features cdn-hash,derive"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

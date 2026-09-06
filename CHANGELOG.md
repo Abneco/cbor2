@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* Enforce complete container consumption after serde visitors, including tuples,
+  bytes-as-sequences, enums and Value conversions. Nested items no longer leak
+  into outer fields; indefinite breaks are consumed exactly once.
+* Parse hexadecimal floats with checked exponent scaling and one final rounding;
+  preserve NaN sign, signaling bit and payload at the shortest exact width.
+  Diagnostic output uses float literals for non-default NaNs.
+* Preserve RawValue bytes and Simple values in derived flattened structs;
+  preserve undefined during canonical encoding of RawValue, and reject CBOR-
+  equivalent signed-zero map keys. Failed Value canonicalization leaves the
+  original value unchanged.
+* Correct float/same extension argument forms, same map equality, fractional
+  epoch conversion, elided UTF-8 concatenation, source CR/raw-string grammar,
+  IP address validation and numeric registered-name CRI hosts.
+* Support container defaults and recursive Self references in the Cbor derive,
+  resolve serde without a direct consumer dependency, and reject positional
+  field configurations that would silently shift data.
+* Correct the Homebrew formula smoke test for pretty diagnostic output.
+
+### Features
+
+* Split `cdn-hash` (no_std + alloc) and `cdn-cri` (requires std). `cdn` enables
+  both and therefore now explicitly requires std; its previous no_std-only
+  combination could not build on bare-metal targets.
+* Add `cdn_to_vec_with_limit` and `cdn_sequence_to_vec_with_limit` to bound
+  source bytes before parsing untrusted diagnostic input.
+
+### Performance
+
+* RawValue writes and sizing no longer copy to a temporary Vec; slice capture
+  copies once, and in-memory validation uses validate_slice.
+* Use one collection buffer per Value struct, shared canonical key arenas and
+  cached key encodings, linear binary/octal/hex integer parsing and decimal
+  limbs, reused text chunk buffers and lookup-based hex output.
+* Validate CLI sequences without buffering item payloads; unify application
+  extension argument dispatch and async/core header interpretation.
+* Add consumer compilation fixtures, allocation contracts, structural and
+  numeric differential checks, and focused benchmarks for the affected paths.
+
 ## [1.1.4] - 2026-07-16
 
 ### Added

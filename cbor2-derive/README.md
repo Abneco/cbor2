@@ -103,6 +103,16 @@ same type; those impls would conflict.
 See the main [`cbor2` README](https://github.com/ldclabs/cbor2#integer-map-keys-and-tags-cose-with-derivecbor)
 for complete COSE examples.
 
+The derive needs only the `cbor2` dependency with `derive` enabled; serde is
+resolved through cbor2. Container `default` and recursive `Self` types are
+supported. Positional arrays reject conditional and one-directional skips;
+use `Option` placeholders or symmetric `#[serde(skip)]` instead.
+
+Flattened structs preserve the exact encoding of declared `RawValue` fields
+and support borrowed fields when decoding from a slice. The binary flatten
+adapter uses cbor2's raw-item protocol; other binary serializers are not
+supported. Human-readable formats keep the ordinary serde representation.
+
 ## License
 
 Licensed under the MIT License.

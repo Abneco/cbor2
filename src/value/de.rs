@@ -276,8 +276,8 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         match self.0 {
             Value::Bytes(x) => visitor.visit_bytes(x),
             Value::Text(x) => visitor.visit_str(x),
-            Value::Array(x) => visitor.visit_seq(self.nested(x.iter())),
-            Value::Map(x) => visitor.visit_map(self.nested(x.iter().peekable())),
+            Value::Array(x) => visit_seq(x, self.1, visitor),
+            Value::Map(x) => visit_map(x, self.1, visitor),
             Value::Bool(x) => visitor.visit_bool(*x),
             Value::Null => visitor.visit_none(),
             Value::Simple(x) => visitor.visit_enum(SimpleAccess::new(*x)),
@@ -316,6 +316,15 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
 
     #[inline]
     fn deserialize_f32<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        let mut value = self.0;
+        while let Value::Tag(_, inner) = value {
+            value = inner;
+        }
+        if let Value::Float(value) = value {
+            if let Some(bits) = crate::core::f64_to_f32(*value) {
+                return visitor.visit_f32(f32::from_bits(bits));
+            }
+        }
         self.deserialize_f64(visitor)
     }
 
@@ -412,7 +421,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
 
         match value {
             Value::Bytes(x) => visitor.visit_bytes(x),
-            Value::Array(x) => visitor.visit_seq(self.nested(x.iter())),
+            Value::Array(x) => visit_seq(x, self.1, visitor),
             _ => Err(de::Error::invalid_type(value.into(), &"bytes")),
         }
     }
@@ -431,7 +440,8 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         }
 
         match value {
-            Value::Array(x) => visitor.visit_seq(self.nested(x.iter())),
+            Value::Array(x) => visit_seq(x, self.1, visitor),
+            Value::Bytes(x) => crate::de::visit_byte_seq(x, visitor).map_err(de::Error::custom),
             _ => Err(de::Error::invalid_type(value.into(), &"array")),
         }
     }
@@ -443,7 +453,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         }
 
         match value {
-            Value::Map(x) => visitor.visit_map(self.nested(x.iter().peekable())),
+            Value::Map(x) => visit_map(x, self.1, visitor),
             _ => Err(de::Error::invalid_type(value.into(), &"map")),
         }
     }
@@ -464,12 +474,9 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         }
 
         match (marker.shape, value) {
-            (StructShape::Map, Value::Map(x)) => visitor.visit_map(StructAccess {
-                iter: x.iter().peekable(),
-                keys: marker.keys,
-            }),
+            (StructShape::Map, Value::Map(x)) => visit_struct_map(x, marker.keys, visitor),
             (StructShape::Map, _) => Err(de::Error::invalid_type(value.into(), &"map")),
-            (StructShape::Array, Value::Array(x)) => visitor.visit_seq(self.nested(x.iter())),
+            (StructShape::Array, Value::Array(x)) => visit_seq(x, self.1, visitor),
             (StructShape::Array, _) => Err(de::Error::invalid_type(value.into(), &"array")),
         }
     }
@@ -640,6 +647,48 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
     }
 }
 
+fn visit_seq<'de, V: de::Visitor<'de>>(
+    items: &[Value],
+    mode: IdentifierMode,
+    visitor: V,
+) -> Result<V::Value, Error> {
+    let mut access = Deserializer(items.iter(), mode);
+    let value = visitor.visit_seq(&mut access)?;
+    if access.0.next().is_some() {
+        return Err(de::Error::custom("unconsumed array elements"));
+    }
+    Ok(value)
+}
+
+fn visit_map<'de, V: de::Visitor<'de>>(
+    items: &[(Value, Value)],
+    mode: IdentifierMode,
+    visitor: V,
+) -> Result<V::Value, Error> {
+    let mut access = Deserializer(items.iter().peekable(), mode);
+    let value = visitor.visit_map(&mut access)?;
+    if access.0.next().is_some() {
+        return Err(de::Error::custom("unconsumed map entries"));
+    }
+    Ok(value)
+}
+
+fn visit_struct_map<'de, V: de::Visitor<'de>>(
+    items: &[(Value, Value)],
+    keys: &'static str,
+    visitor: V,
+) -> Result<V::Value, Error> {
+    let mut access = StructAccess {
+        iter: items.iter().peekable(),
+        keys,
+    };
+    let value = visitor.visit_map(&mut access)?;
+    if access.iter.next().is_some() {
+        return Err(de::Error::custom("unconsumed map entries"));
+    }
+    Ok(value)
+}
+
 impl<'a, 'de, T: Iterator<Item = &'a Value>> de::SeqAccess<'de> for Deserializer<T> {
     type Error = Error;
 
@@ -679,7 +728,11 @@ impl<'a, 'de, T: Iterator<Item = &'a (Value, Value)>> de::MapAccess<'de>
         seed: V,
     ) -> Result<V::Value, Self::Error> {
         let mode = self.1;
-        seed.deserialize(Deserializer(&self.0.next().unwrap().1, mode))
+        let pair = self
+            .0
+            .next()
+            .ok_or_else(|| <Error as de::Error>::custom("missing map value"))?;
+        seed.deserialize(Deserializer(&pair.1, mode))
     }
 
     #[inline]
@@ -862,20 +915,23 @@ impl<'de> de::VariantAccess<'de> for KeyedVariant<'_> {
             .as_ref()
             .map_or(StructShape::Map, |marker| marker.shape);
         match (shape, value) {
-            (StructShape::Map, Value::Map(x)) => visitor.visit_map(StructAccess {
-                iter: x.iter().peekable(),
-                keys: self.marker.as_ref().map_or("", |marker| marker.keys),
-            }),
+            (StructShape::Map, Value::Map(x)) => visit_struct_map(
+                x,
+                self.marker.as_ref().map_or("", |marker| marker.keys),
+                visitor,
+            ),
             (StructShape::Map, _) => Err(de::Error::invalid_type(value.into(), &"map")),
-            (StructShape::Array, Value::Array(x)) => visitor.visit_seq(Deserializer::new(x.iter())),
+            (StructShape::Array, Value::Array(x)) => {
+                visit_seq(x, IdentifierMode::Placeholder, visitor)
+            }
             (StructShape::Array, _) => Err(de::Error::invalid_type(value.into(), &"array")),
         }
     }
 }
 
-impl<'a, 'de> de::EnumAccess<'de> for Deserializer<&'a Value> {
+impl<'de> de::EnumAccess<'de> for Deserializer<&Value> {
     type Error = Error;
-    type Variant = Deserializer<&'a Value>;
+    type Variant = TextVariant;
 
     #[inline]
     fn variant_seed<V: de::DeserializeSeed<'de>>(
@@ -883,7 +939,38 @@ impl<'a, 'de> de::EnumAccess<'de> for Deserializer<&'a Value> {
         seed: V,
     ) -> Result<(V::Value, Self::Variant), Self::Error> {
         let key = seed.deserialize(self)?;
-        Ok((key, Deserializer::new(&Value::Null)))
+        Ok((key, TextVariant))
+    }
+}
+
+struct TextVariant;
+
+impl<'de> de::VariantAccess<'de> for TextVariant {
+    type Error = Error;
+    fn unit_variant(self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn newtype_variant_seed<U: de::DeserializeSeed<'de>>(self, _: U) -> Result<U::Value, Error> {
+        Err(de::Error::invalid_type(
+            de::Unexpected::UnitVariant,
+            &"newtype variant",
+        ))
+    }
+    fn tuple_variant<V: de::Visitor<'de>>(self, _: usize, _: V) -> Result<V::Value, Error> {
+        Err(de::Error::invalid_type(
+            de::Unexpected::UnitVariant,
+            &"tuple variant",
+        ))
+    }
+    fn struct_variant<V: de::Visitor<'de>>(
+        self,
+        _: &'static [&'static str],
+        _: V,
+    ) -> Result<V::Value, Error> {
+        Err(de::Error::invalid_type(
+            de::Unexpected::UnitVariant,
+            &"struct variant",
+        ))
     }
 }
 

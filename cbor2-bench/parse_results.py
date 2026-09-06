@@ -3,7 +3,7 @@
 import re
 import sys
 
-ID_RE = re.compile(r"^(alloc|std|no_alloc)/\S+")
+ID_RE = re.compile(r"^(alloc|std|no_alloc|focused)/\S+")
 # median is the middle value inside `time:   [low  median  high]`
 TIME_RE = re.compile(r"time:\s*\[\s*(\S+ \S+)\s+(\S+ \S+)\s+(\S+ \S+)\s*\]")
 
@@ -55,7 +55,7 @@ print(table("std", ["encode", "decode"]))
 print("\n### no_alloc — encode (fixed buffer, zero allocation)\n")
 print(table("no_alloc", ["encode"]))
 print("\n### no_alloc — structural scan (the only no-alloc reads available)\n")
-scan = ["cbor2 (validate)", "minicbor (skip)"]
+scan = ["cbor2 (validate)", "cbor2 (validate_slice)", "minicbor (skip)"]
 hdr = "| payload | " + " | ".join(scan) + " |"
 print(hdr)
 print("|" + "---|" * (len(scan) + 1))
@@ -68,3 +68,9 @@ print("|---|---|")
 for p in PAYLOADS:
     print(f"| `{p}` | {fmt(results.get('no_alloc/serialized_size (cbor2)/' + p))} |")
 print(f"\n_({len(results)} measurements parsed)_")
+
+focused = [(key, value) for key, value in sorted(results.items()) if key.startswith("focused/")]
+if focused:
+    print("\n### Focused workloads\n\n| operation | estimate |\n|---|---|")
+    for key, value in focused:
+        print(f"| `{key}` | {value} |")

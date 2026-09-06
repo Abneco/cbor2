@@ -48,23 +48,9 @@ pub(super) fn write_uint(
 }
 
 fn write_preferred_uint(out: &mut Vec<u8>, major: u8, value: u64) {
-    let prefix = major << 5;
-    match value {
-        x if x <= 23 => out.push(prefix | x as u8),
-        x if x <= u8::MAX as u64 => out.extend_from_slice(&[prefix | 24, x as u8]),
-        x if x <= u16::MAX as u64 => {
-            out.push(prefix | 25);
-            out.extend_from_slice(&(x as u16).to_be_bytes());
-        }
-        x if x <= u32::MAX as u64 => {
-            out.push(prefix | 26);
-            out.extend_from_slice(&(x as u32).to_be_bytes());
-        }
-        x => {
-            out.push(prefix | 27);
-            out.extend_from_slice(&x.to_be_bytes());
-        }
-    }
+    crate::core::Encoder::from(out)
+        .push_uint(major, value)
+        .expect("Vec writes are infallible");
 }
 
 pub(super) fn write_definite_bytes(

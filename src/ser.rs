@@ -348,7 +348,7 @@ impl<'a, W: Write> ser::Serializer for &'a mut Serializer<W> {
 
     #[inline]
     fn serialize_f32(self, v: f32) -> Result<(), Error> {
-        self.serialize_f64(v.into())
+        self.serialize_f64(crate::core::f32_to_f64(v.to_bits()))
     }
 
     #[inline]
@@ -414,10 +414,9 @@ impl<'a, W: Write> ser::Serializer for &'a mut Serializer<W> {
         // A `RawValue` splices its already-encoded bytes into the stream.
         #[cfg(feature = "alloc")]
         if name == crate::raw::NAME {
-            return match value.serialize(crate::raw::RawBytesSerializer) {
-                Ok(bytes) => Ok(self.0.write_all(&bytes)?),
-                Err(err) => Err(Error::Value(err.to_string())),
-            };
+            return value.serialize(crate::raw::RawBytesSerializer {
+                write: |bytes: &[u8]| self.0.write_all(bytes).map_err(Error::from),
+            });
         }
 
         if let Some(StructMarker { tag: Some(tag), .. }) = parse_struct_marker(name) {
@@ -894,11 +893,12 @@ pub fn to_vec<T: ?Sized + ser::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
 /// Serializes a value as CBOR into the front of `buffer`, returning the
 /// written prefix.
 ///
-/// This never allocates, which makes it the natural encoding function
+/// The encoder itself never allocates, which makes this the natural function
 /// without the `alloc` feature; a buffer too small for the value fails
 /// with an [`Error::Io`] of kind
 /// [`WriteZero`](crate::io::ErrorKind::WriteZero). Use [`serialized_size`]
-/// to size the buffer in advance.
+/// to size the buffer in advance. A custom `Serialize` implementation can
+/// still allocate; derived flattened structs buffer their map before writing.
 ///
 /// ```rust
 /// let mut buffer = [0u8; 64];
@@ -921,7 +921,8 @@ pub fn to_slice<'a, T: ?Sized + ser::Serialize>(
 /// The value is serialized through the regular serializer into a counting
 /// sink, so the result is exact by construction (including preferred float
 /// widths, bignums, tags and indefinite-length containers) and no memory is
-/// allocated.
+/// allocated by the encoder. As with [`to_slice`], the value's `Serialize`
+/// implementation may allocate (for example, a derived flattened struct).
 ///
 /// ```rust
 /// let value = ("hello", 42u64, vec![1u8, 2, 3]);
@@ -1019,8 +1020,9 @@ pub fn to_canonical_vec_with<T: ?Sized + ser::Serialize>(
     value: &T,
     order: KeyOrder,
 ) -> Result<Vec<u8>, Error> {
+    let value = crate::value::Value::serialized(value)?;
     let mut buffer = Vec::new();
-    to_canonical_writer_with(value, VecWriter(&mut buffer), order)?;
+    crate::value::canonical_to_writer(&value, VecWriter(&mut buffer), order)?;
     Ok(buffer)
 }
 

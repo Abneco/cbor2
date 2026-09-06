@@ -593,6 +593,12 @@ fn push_key_comment(out: &mut String, name: &str) {
     out.push('"');
 }
 
+fn push_hex_byte(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(char::from(HEX[(byte >> 4) as usize]));
+    out.push(char::from(HEX[(byte & 15) as usize]));
+}
+
 // Renders a definite-length byte string as `h'..'`, reading the body in
 // fixed-size chunks.
 fn hex_segment<R: Read>(
@@ -610,7 +616,7 @@ fn hex_segment<R: Read>(
         remaining -= n;
 
         for b in &buffer[..n] {
-            let _ = write!(out, "{b:02x}");
+            push_hex_byte(out, *b);
         }
     }
 
@@ -712,7 +718,15 @@ pub(crate) fn escape_into(out: &mut String, s: &str) {
 // otherwise, and the literals `Infinity`, `-Infinity` and `NaN`.
 pub(crate) fn write_float(out: &mut String, x: f64) {
     if x.is_nan() {
-        out.push_str("NaN");
+        if x.to_bits() == f64::NAN.to_bits() {
+            out.push_str("NaN");
+        } else if let Some(bits) = crate::core::f64_to_f16(x) {
+            let _ = write!(out, "float'{bits:04x}'");
+        } else if let Some(bits) = crate::core::f64_to_f32(x) {
+            let _ = write!(out, "float'{bits:08x}'");
+        } else {
+            let _ = write!(out, "float'{:016x}'", x.to_bits());
+        }
         return;
     }
     if x.is_infinite() {
@@ -838,7 +852,7 @@ pub(crate) fn write_bignum(out: &mut String, tag_number: u64, payload: &[u8]) {
 fn write_tagged_bytes(out: &mut String, tag: u64, payload: &[u8]) {
     let _ = write!(out, "{tag}(h'");
     for b in payload {
-        let _ = write!(out, "{b:02x}");
+        push_hex_byte(out, *b);
     }
     out.push_str("')");
 }
@@ -861,7 +875,7 @@ pub(crate) fn write_value(out: &mut String, value: &Value, depth: usize) -> core
         Value::Bytes(x) => {
             out.push_str("h'");
             for b in x {
-                let _ = write!(out, "{b:02x}");
+                push_hex_byte(out, *b);
             }
             out.push('\'');
         }

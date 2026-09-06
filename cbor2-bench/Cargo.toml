@@ -61,6 +61,10 @@ harness = false
 name = "no_alloc"
 harness = false
 
+[[bench]]
+name = "focused"
+harness = false
+
 # Optimize the comparison the way a release build would.
 [profile.bench]
 lto = "thin"

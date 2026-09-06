@@ -577,10 +577,12 @@ fn draft26_appendix_a_cdn_examples() {
 #[cfg(not(feature = "cdn"))]
 #[test]
 fn draft26_unresolved_app_examples_without_cdn_feature() {
+    #[cfg(not(feature = "cdn-cri"))]
     assert_cdn_eq(
         "cri'https://example.com'",
         r#"999(["cri", ["https://example.com"]])"#,
     );
+    #[cfg(not(feature = "cdn-hash"))]
     assert_cdn_eq(r#"hash<<"data", -44>>"#, r#"999(["hash", ["data", -44]])"#);
 }
 

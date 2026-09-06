@@ -32,29 +32,66 @@ pub(super) fn parse_bigint_digits(
     base: u32,
     offset: usize,
 ) -> Result<BigInt, Error> {
+    let digits = digits.trim_start_matches('0');
     let mut magnitude = Vec::new();
-    for ch in digits.chars() {
-        let digit = ch.to_digit(base).ok_or(Error::Syntax(offset))?;
-        mul_add(&mut magnitude, base, digit);
+    if digits.is_empty() {
+        return Ok(BigInt {
+            negative: false,
+            magnitude,
+        });
     }
-    strip_leading_zeroes(&mut magnitude);
+    if let Ok(value) = u128::from_str_radix(digits, base) {
+        let bytes = value.to_be_bytes();
+        magnitude.extend_from_slice(&bytes[value.leading_zeros() as usize / 8..]);
+    } else if matches!(base, 2 | 8 | 16) {
+        let width = base.trailing_zeros();
+        let mut bits = 0;
+        let mut acc = 0u16;
+        for ch in digits.chars().rev() {
+            let digit = ch.to_digit(base).ok_or(Error::Syntax(offset))? as u16;
+            acc |= digit << bits;
+            bits += width;
+            if bits >= 8 {
+                magnitude.push(acc as u8);
+                acc >>= 8;
+                bits -= 8;
+            }
+        }
+        if acc != 0 {
+            magnitude.push(acc as u8);
+        }
+        magnitude.reverse();
+    } else {
+        // Base-2^32 limbs, nine decimal digits at a time. No front insertion.
+        let mut limbs = Vec::<u32>::new();
+        let mut pos = 0;
+        let first = match digits.len() % 9 {
+            0 => 9,
+            n => n,
+        };
+        while pos < digits.len() {
+            let len = if pos == 0 { first } else { 9 };
+            let chunk = digits.get(pos..pos + len).ok_or(Error::Syntax(offset))?;
+            let mut carry = u64::from(chunk.parse::<u32>().map_err(|_| Error::Syntax(offset))?);
+            for limb in &mut limbs {
+                let value = u64::from(*limb) * 1_000_000_000 + carry;
+                *limb = value as u32;
+                carry = value >> 32;
+            }
+            if carry != 0 {
+                limbs.push(carry as u32);
+            }
+            pos += len;
+        }
+        for limb in limbs.into_iter().rev() {
+            magnitude.extend_from_slice(&limb.to_be_bytes());
+        }
+        strip_leading_zeroes(&mut magnitude);
+    }
     Ok(BigInt {
-        negative: negative && !magnitude.is_empty(),
+        negative,
         magnitude,
     })
-}
-
-fn mul_add(bytes: &mut Vec<u8>, base: u32, digit: u32) {
-    let mut carry = digit;
-    for byte in bytes.iter_mut().rev() {
-        let x = u32::from(*byte) * base + carry;
-        *byte = x as u8;
-        carry = x >> 8;
-    }
-    while carry > 0 {
-        bytes.insert(0, carry as u8);
-        carry >>= 8;
-    }
 }
 
 fn strip_leading_zeroes(bytes: &mut Vec<u8>) {
@@ -98,57 +135,82 @@ pub(super) fn parse_hex_float(lex: &str, offset: usize) -> Result<f64, Error> {
         .or_else(|| rest.strip_prefix("0X"))
         .ok_or(Error::Syntax(offset))?;
     let (mantissa, exp) = rest.split_once(['p', 'P']).ok_or(Error::Syntax(offset))?;
-    let exponent: i32 = exp
-        .parse()
-        .map_err(|_| Error::semantic(offset, format!("invalid hex float exponent `{exp}`")))?;
-
-    let mut value = 0.0f64;
-    let mut frac_digits = 0i32;
-    let mut after_point = false;
-    for ch in mantissa.chars() {
-        if ch == '.' {
-            if after_point {
-                return Err(Error::Syntax(offset));
-            }
-            after_point = true;
-            continue;
+    let (exp_negative, exp_digits) = strip_sign(exp);
+    let mut exponent = 0i64;
+    for byte in exp_digits.bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(Error::Syntax(offset));
         }
+        exponent = exponent
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'));
+    }
+    if exp_negative {
+        exponent = -exponent;
+    }
+    let frac_digits = mantissa.split_once('.').map_or(0, |(_, frac)| frac.len());
+    let scale = exponent.saturating_sub((frac_digits as i64).saturating_mul(4));
+    // Keep 53 significant bits, one rounding bit and a sticky bit. Never
+    // perform floating arithmetic before the final IEEE 754 representation.
+    let mut significand = 0u64;
+    let mut length = 0i64;
+    let mut kept = 0u32;
+    let mut sticky = false;
+    for ch in mantissa.chars().filter(|&ch| ch != '.') {
         let digit = ch.to_digit(16).ok_or(Error::Syntax(offset))?;
-        value = value * 16.0 + f64::from(digit);
-        if after_point {
-            frac_digits += 1;
+        for bit in (0..4).rev() {
+            let one = (digit >> bit) & 1;
+            if length == 0 && one == 0 {
+                continue;
+            }
+            length += 1;
+            if kept < 54 {
+                significand = (significand << 1) | u64::from(one);
+                kept += 1;
+            } else {
+                sticky |= one != 0;
+            }
         }
     }
-
-    value *= exp2(exponent - 4 * frac_digits);
-    // A literal beyond the f64 range would silently change the data; the
-    // encoding-indicator rules of CDN reject lossy re-encodings, so an
-    // unrepresentable literal is rejected the same way. (A non-finite
-    // intermediate also poisons the scaling above.)
-    if !value.is_finite() {
-        return Err(Error::semantic(
-            offset,
-            format!("hex float `{lex}` overflows the f64 range"),
-        ));
+    let sign = u64::from(negative) << 63;
+    if length == 0 {
+        return Ok(f64::from_bits(sign));
     }
-    if negative {
-        value = -value;
+    let mut exponent = scale.saturating_add(length - 1);
+    let overflow = || Error::semantic(offset, format!("hex float `{lex}` overflows the f64 range"));
+    if exponent > 1023 {
+        return Err(overflow());
     }
-    Ok(value)
-}
-
-fn exp2(n: i32) -> f64 {
-    if n < -1074 {
-        return 0.0;
+    if exponent < -1075 {
+        return Ok(f64::from_bits(sign));
     }
-    if n > 1023 {
-        return f64::INFINITY;
-    }
-    if n >= -1022 {
-        f64::from_bits(((n + 1023) as u64) << 52)
+    let precision = if exponent >= -1022 {
+        53
     } else {
-        f64::from_bits(1u64 << (n + 1074))
+        (exponent + 1075) as u32
+    };
+    let mut rounded = if kept <= precision {
+        significand << (precision - kept)
+    } else {
+        let shift = kept - precision;
+        let head = significand >> shift;
+        let guard = (significand >> (shift - 1)) & 1;
+        let tail = significand & ((1u64 << (shift - 1)) - 1);
+        head + u64::from(guard != 0 && (sticky || tail != 0 || head & 1 != 0))
+    };
+    if exponent < -1022 {
+        return Ok(f64::from_bits(sign | rounded));
     }
+    if rounded == 1 << 53 {
+        rounded >>= 1;
+        exponent += 1;
+        if exponent > 1023 {
+            return Err(overflow());
+        }
+    }
+    Ok(f64::from_bits(
+        sign | (((exponent + 1023) as u64) << 52) | (rounded & ((1 << 52) - 1)),
+    ))
 }
 
 impl BigInt {

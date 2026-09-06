@@ -154,7 +154,9 @@ assert_eq!(photo, back);
 | --------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `std`     | 是               | 为每个 `std::io::Read`/`Write` 实现 `cbor2::io` 特征，添加 `async_io` 并添加 `HashMap` 转换。隐式启用 `alloc`。         |
 | `alloc`   | 是（通过 `std`） | 所有需要堆的操作：`Value`、`to_vec`/`from_slice`/`from_reader`、`RawValue`、`diagnostic`、确定性编码器以及 `cbor!` 宏。 |
-| `cdn`     | 否               | 添加需要外部 crate 的 CDN 输入扩展：`hash`、`cri` 和 `CRI`。隐式启用 `alloc`。                                          |
+| `cdn` | 否 | 同时启用 `cdn-hash` 和 `cdn-cri`；需要 `std`。 |
+| `cdn-hash` | 否 | 哈希字面量；支持 `no_std + alloc`。 |
+| `cdn-cri` | 否 | CRI 字面量；IRI 解析器需要 `std`。 |
 | `derive`  | 否               | `#[derive(cbor2::Cbor)]` 宏。                                                                                           |
 | `futures` | 否               | 为 `futures_io::AsyncRead`/`AsyncWrite` 添加 `async_io::futures` 辅助函数。隐式启用 `std`。                             |
 | `tokio`   | 否               | 为 `tokio::io::AsyncRead`/`AsyncWrite` 添加 `async_io::tokio` 辅助函数。隐式启用 `std`。                                |
@@ -544,11 +546,15 @@ valid
 
 ## 测试
 
-`cargo test` 会运行单元测试、单个集成测试二进制文件和文档测试 —— 包括 RFC 8949 附录 A 的测试向量，以及针对 I/O 失败和格式错误输入的错误注入测试。CI 在各种特性组合下进行构建和测试，乃至裸机 `no_std` 目标。使用 `cargo llvm-cov` 测得的代码覆盖率为 100% 的函数覆盖率和约 98% 的行覆盖率；唯一未执行的行是无法发生的防御性分支，例如 `RawValue` 有效性不变性规则排除了的错误路径。
+`cargo test` 会运行单元测试、集成测试、分配契约测试和文档测试 —— 包括 RFC 8949 附录 A 的测试向量，以及针对 I/O 失败和格式错误输入的错误注入测试。CI 在各种特性组合下进行构建和测试，乃至裸机 `no_std` 目标。可使用 `cargo llvm-cov` 重新测量当前代码的覆盖率；测试通过不代表已经覆盖所有输入。
 
 ## 最低支持的 Rust 版本
 
-Rust 1.85。
+Rust 1.89。
+
+使用 `derive` 时，宏通过 cbor2 访问 serde，不必额外声明 serde 依赖；自己的代码直接使用 serde API 或派生宏时仍需添加。容器默认值和递归 `Self` 字段均受支持。数组形状不允许条件省略或单向跳过字段；请用 `Option` 占位，或用 `#[serde(skip)]` 同时跳过编解码。
+
+不可信 CDN 文本可使用 `cdn_to_vec_with_limit(text, max_source_bytes)` 或 `cdn_sequence_to_vec_with_limit`，在规范化与解析之前限制源码字节数。二、八、十六进制整数按线性时间解析；任意精度十进制转换仍需合理的输入预算。
 
 ## 许可协议
 

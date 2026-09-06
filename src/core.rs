@@ -401,7 +401,11 @@ impl<R: Read> From<R> for Decoder<R> {
 }
 
 #[inline]
-fn decode_header(raw: &[u8; 9], arg: Option<u64>, start: usize) -> Result<Header, Error> {
+pub(crate) fn decode_header(
+    raw: &[u8; 9],
+    arg: Option<u64>,
+    start: usize,
+) -> Result<Header, Error> {
     let major = raw[0] >> 5;
     let minor = raw[0] & 0b00011111;
 
@@ -435,9 +439,9 @@ fn decode_header(raw: &[u8; 9], arg: Option<u64>, start: usize) -> Result<Header
             24 if raw[1] >= 32 => Header::Simple(raw[1]),
             24 => return Err(Error::Syntax(start)),
             25 => Header::Float(f16_to_f64(u16::from_be_bytes([raw[1], raw[2]]))),
-            26 => Header::Float(
-                f32::from_bits(u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]])) as f64,
-            ),
+            26 => Header::Float(f32_to_f64(u32::from_be_bytes([
+                raw[1], raw[2], raw[3], raw[4],
+            ]))),
             27 => Header::Float(f64::from_bits(u64::from_be_bytes([
                 raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8],
             ]))),
@@ -619,33 +623,32 @@ impl<R: Read> Decoder<R> {
     /// handled transparently; every segment must itself be valid UTF-8.
     #[cfg(feature = "alloc")]
     pub fn text_body(&mut self, len: Option<usize>, out: &mut String) -> Result<(), Error> {
-        let read_segment = |me: &mut Self, len: usize, out: &mut String| {
-            let offset = me.offset;
-            let mut buffer = Vec::new();
-            me.read_body(len, &mut buffer)?;
-            match String::from_utf8(buffer) {
-                Ok(s) if out.is_empty() => {
-                    *out = s;
-                    Ok(())
-                }
-                Ok(s) => {
-                    out.push_str(&s);
-                    Ok(())
-                }
-                Err(..) => Err(Error::Syntax(offset)),
+        let mut buffer = Vec::new();
+        if let Some(len) = len {
+            let offset = self.offset;
+            self.read_body(len, &mut buffer)?;
+            let text = String::from_utf8(buffer).map_err(|_| Error::Syntax(offset))?;
+            if out.is_empty() {
+                *out = text;
+            } else {
+                out.push_str(&text);
             }
-        };
-
-        match len {
-            Some(len) => read_segment(self, len, out),
-            None => loop {
-                let offset = self.offset;
-                match self.pull()? {
-                    Header::Break => return Ok(()),
-                    Header::Text(Some(len)) => read_segment(self, len, out)?,
-                    _ => return Err(Error::Syntax(offset)),
+            return Ok(());
+        }
+        loop {
+            let offset = self.offset;
+            match self.pull()? {
+                Header::Break => return Ok(()),
+                Header::Text(Some(len)) => {
+                    let body_offset = self.offset;
+                    buffer.clear();
+                    self.read_body(len, &mut buffer)?;
+                    let text =
+                        core::str::from_utf8(&buffer).map_err(|_| Error::Syntax(body_offset))?;
+                    out.push_str(text);
                 }
-            },
+                _ => return Err(Error::Syntax(offset)),
+            }
         }
     }
 }
@@ -800,12 +803,12 @@ impl Decoder<&[u8]> {
                     return Some(Err(self.slice_eof_after_prefix()));
                 }
                 (
-                    f32::from_bits(u32::from_be_bytes([
+                    f32_to_f64(u32::from_be_bytes([
                         self.reader[1],
                         self.reader[2],
                         self.reader[3],
                         self.reader[4],
-                    ])) as f64,
+                    ])),
                     5,
                 )
             }
@@ -950,10 +953,16 @@ fn exp2(n: i32) -> f64 {
 
 /// Converts IEEE 754 half-precision bits to an `f64`.
 ///
-/// This follows the decoding algorithm given in RFC 8949 Appendix D.
+/// This follows RFC 8949 Appendix D, additionally preserving NaN sign,
+/// signaling bit and payload through a bitwise widening.
 pub fn f16_to_f64(bits: u16) -> f64 {
     let exp = (bits >> 10) & 0x1f;
     let frac = (bits & 0x3ff) as f64;
+    if exp == 31 && frac != 0.0 {
+        return f64::from_bits(
+            (u64::from(bits >> 15) << 63) | 0x7ff0_0000_0000_0000 | (u64::from(bits & 0x3ff) << 42),
+        );
+    }
 
     let value = match exp {
         0 => frac * exp2(-24),
@@ -967,6 +976,18 @@ pub fn f16_to_f64(bits: u16) -> f64 {
     } else {
         -value
     }
+}
+
+// Numeric casts may quiet signaling NaNs; widening their bits avoids that.
+pub(crate) fn f32_to_f64(bits: u32) -> f64 {
+    if bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x007f_ffff != 0 {
+        return f64::from_bits(
+            (u64::from(bits >> 31) << 63)
+                | 0x7ff0_0000_0000_0000
+                | (u64::from(bits & 0x007f_ffff) << 29),
+        );
+    }
+    f64::from(f32::from_bits(bits))
 }
 
 /// Converts an `f64` to IEEE 754 single-precision bits if (and only if) the
@@ -992,7 +1013,7 @@ pub fn f64_to_f32(value: f64) -> Option<u32> {
 
     // Belt and braces: only report success on an exact bit-level round trip
     // through the same widening the decoder performs.
-    if (f32::from_bits(single) as f64).to_bits() == bits {
+    if f32_to_f64(single).to_bits() == bits {
         Some(single)
     } else {
         None
@@ -1000,8 +1021,7 @@ pub fn f64_to_f32(value: f64) -> Option<u32> {
 }
 
 /// Converts an `f64` to IEEE 754 half-precision bits if (and only if) the
-/// conversion is lossless. NaN converts to the canonical quiet NaN of the
-/// same sign.
+/// conversion is lossless, including the sign, signaling bit and payload of NaNs.
 pub fn f64_to_f16(value: f64) -> Option<u16> {
     let bits = value.to_bits();
     let sign = ((bits >> 48) & 0x8000) as u16;
@@ -1009,13 +1029,10 @@ pub fn f64_to_f16(value: f64) -> Option<u16> {
     let frac = bits & 0x000f_ffff_ffff_ffff;
 
     let half = if exp == 0x7ff {
-        // Infinity or NaN. Any NaN becomes the canonical quiet NaN of the
-        // same sign; the round-trip check below rejects NaNs whose payload
-        // would be lost.
-        match frac {
-            0 => sign | 0x7c00,
-            _ => sign | 0x7e00,
+        if frac & ((1 << 42) - 1) != 0 {
+            return None;
         }
+        sign | 0x7c00 | (frac >> 42) as u16
     } else {
         let unbiased = exp - 1023;
         if exp == 0 && frac == 0 {
@@ -1057,22 +1074,12 @@ mod tests {
     fn f16_exhaustive_roundtrip() {
         for bits in 0..=u16::MAX {
             let wide = f16_to_f64(bits);
-
-            if wide.is_nan() {
-                // NaN payloads are not preserved; the canonical NaN of
-                // either sign is.
-                let canonical = (bits & 0x8000) | 0x7e00;
-                assert_eq!(f64_to_f16(wide), Some(canonical), "bits {bits:04x}");
-                continue;
-            }
-
-            assert_eq!(f64_to_f16(wide), Some(bits), "bits {bits:04x} ({wide})");
+            assert_eq!(f64_to_f16(wide), Some(bits), "bits {bits:04x}");
         }
     }
 
     // Every f32 bit pattern must survive widening to f64 and re-narrowing,
-    // NaN payloads included (quiet NaNs only: the widening cast may quieten
-    // a signaling NaN, which the round-trip check then rejects).
+    // NaN payloads and signaling bits included.
     #[test]
     fn f32_narrowing_roundtrip() {
         for bits in [
@@ -1086,8 +1093,9 @@ mod tests {
             0x7fc0_0000,    // canonical quiet NaN
             0xffc0_0000,    // -NaN
             0x7fc0_0100,    // quiet NaN with payload
+            0x7f80_0001,    // signaling NaN with payload
         ] {
-            let wide = f32::from_bits(bits) as f64;
+            let wide = f32_to_f64(bits);
             assert_eq!(f64_to_f32(wide), Some(bits), "bits {bits:08x}");
         }
     }

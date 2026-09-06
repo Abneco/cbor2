@@ -387,8 +387,9 @@ assert_eq!(cbor2::to_slice(&value, &mut buffer).unwrap(), &bytes[..]);
   [`diagnostic`]/[`diagnostic_pretty`], the deterministic encoders and
   the [`cbor!`] macro. Readers and writers
   are byte slices, `Vec<u8>`, or custom [`io`] trait implementations.
-* **`cdn`** — enables CDN input extensions that need external crates:
-  `hash` plus `cri`/`CRI` literals. Implies `alloc`.
+* **`cdn`** — enables `cdn-hash` and `cdn-cri`. Requires `std`.
+* **`cdn-hash`** — enables hash literals with `no_std` + `alloc` support.
+* **`cdn-cri`** — enables `cri`/`CRI` literals; the IRI parser requires `std`.
 * **neither** — a `#![no_std]` core for constrained targets: streaming
   serialization with [`to_writer`]/[`to_slice`]/[`serialized_size`],
   [`validate`]/[`validate_slice`], the [`tag`] wrappers and the [`core`]
@@ -566,6 +567,8 @@ pub mod core;
 pub mod de;
 #[cfg(feature = "alloc")]
 mod diag;
+#[cfg(feature = "alloc")]
+mod flatten;
 pub mod io;
 #[cfg(feature = "alloc")]
 mod raw;
@@ -577,8 +580,8 @@ pub mod value;
 
 #[cfg(feature = "alloc")]
 pub use crate::cdn::{
-    cdn_sequence_to_vec, cdn_to_vec, from_cdn, to_cdn, to_cdn_pretty,
-    to_cdn_pretty_with_key_comments,
+    cdn_sequence_to_vec, cdn_sequence_to_vec_with_limit, cdn_to_vec, cdn_to_vec_with_limit,
+    from_cdn, to_cdn, to_cdn_pretty, to_cdn_pretty_with_key_comments,
 };
 #[cfg(feature = "alloc")]
 #[doc(inline)]
@@ -600,12 +603,15 @@ pub use crate::simple::Simple;
 #[cfg(feature = "alloc")]
 #[doc(inline)]
 pub use crate::value::{KeyOrder, Value};
+#[doc(hidden)]
+pub use serde as __serde;
 
 // Internal items that the `cbor!` macro expansion needs to reach through
 // `$crate`. Not public API.
 #[cfg(feature = "alloc")]
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::flatten::{deserialize as flatten_deserialize, serialize as flatten_serialize};
     use alloc::string::String;
 
     use crate::value::{self, Integer, Value};

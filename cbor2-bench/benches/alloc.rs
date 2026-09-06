@@ -116,7 +116,9 @@ fn bench_decode(c: &mut Criterion) {
             x.iter(|| cbor2::from_slice::<Vec<LogEntry>>(black_box(&cbor2_b)).unwrap())
         });
         g.bench_function("ciborium", |x| {
-            x.iter(|| ciborium::from_reader::<Vec<LogEntry>, _>(black_box(&ciborium_b[..])).unwrap())
+            x.iter(|| {
+                ciborium::from_reader::<Vec<LogEntry>, _>(black_box(&ciborium_b[..])).unwrap()
+            })
         });
         g.bench_function("serde_cbor", |x| {
             x.iter(|| serde_cbor::from_slice::<Vec<LogEntry>>(black_box(&serde_b)).unwrap())

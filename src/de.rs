@@ -302,6 +302,10 @@ pub trait BorrowSource<'de>: Source {
     // means the caller must copy the body through `bytes_body`/`text_body`.
     #[doc(hidden)]
     fn borrow_body(&mut self, len: usize) -> Option<Result<&'de [u8], crate::io::Error>>;
+    #[doc(hidden)]
+    fn borrow_item(&mut self, _recurse: usize) -> Option<Result<&'de [u8], Error>> {
+        None
+    }
 }
 
 /// A [`Source`] over any [`Read`]; always copies string bodies.
@@ -372,7 +376,7 @@ impl<'de, R: Read> BorrowSource<'de> for ReaderSource<R> {
 
 /// A [`Source`] over a byte slice; borrows definite-length string bodies.
 #[cfg(feature = "alloc")]
-pub struct SliceSource<'de>(Decoder<&'de [u8]>);
+pub struct SliceSource<'de>(Decoder<&'de [u8]>, &'de [u8]);
 
 #[cfg(feature = "alloc")]
 impl sealed::Sealed for SliceSource<'_> {}
@@ -420,7 +424,14 @@ impl Source for SliceSource<'_> {
                 out.extend_from_slice(self.0.borrow_body(len)?);
                 Ok(())
             }
-            None => self.0.bytes_body(None, out),
+            None => loop {
+                let offset = self.0.offset();
+                match self.0.pull_slice()? {
+                    Header::Break => return Ok(()),
+                    Header::Bytes(Some(len)) => out.extend_from_slice(self.0.borrow_body(len)?),
+                    _ => return Err(crate::core::Error::Syntax(offset)),
+                }
+            },
         }
     }
 
@@ -439,7 +450,20 @@ impl Source for SliceSource<'_> {
                 out.push_str(text);
                 Ok(())
             }
-            None => self.0.text_body(None, out),
+            None => loop {
+                let offset = self.0.offset();
+                match self.0.pull_slice()? {
+                    Header::Break => return Ok(()),
+                    Header::Text(Some(len)) => {
+                        let body_offset = self.0.offset();
+                        let body = self.0.borrow_body(len)?;
+                        let text = core::str::from_utf8(body)
+                            .map_err(|_| crate::core::Error::Syntax(body_offset))?;
+                        out.push_str(text);
+                    }
+                    _ => return Err(crate::core::Error::Syntax(offset)),
+                }
+            },
         }
     }
 
@@ -454,10 +478,9 @@ impl Source for SliceSource<'_> {
     }
 
     fn capture(&mut self, recurse: usize) -> Result<Vec<u8>, Error> {
-        self.0.start_recording();
-        let result = validate_item_slice(&mut self.0, recurse);
-        let bytes = self.0.take_recording();
-        result.map(|()| bytes)
+        let start = self.0.offset();
+        validate_item_slice(&mut self.0, recurse)?;
+        Ok(self.1[start..self.0.offset()].to_vec())
     }
 }
 
@@ -466,6 +489,10 @@ impl<'de> BorrowSource<'de> for SliceSource<'de> {
     #[inline]
     fn borrow_body(&mut self, len: usize) -> Option<Result<&'de [u8], crate::io::Error>> {
         Some(self.0.borrow_body(len))
+    }
+    fn borrow_item(&mut self, recurse: usize) -> Option<Result<&'de [u8], Error>> {
+        let start = self.0.offset();
+        Some(validate_item_slice(&mut self.0, recurse).map(|()| &self.1[start..self.0.offset()]))
     }
 }
 
@@ -492,6 +519,7 @@ pub struct Deserializer<S> {
     source: S,
     scratch: Vec<u8>,
     recurse: usize,
+    preserve_simple: bool,
 }
 
 /// The default recursion limit for nested CBOR items.
@@ -519,6 +547,7 @@ impl<R: Read> Deserializer<ReaderSource<R>> {
             source: ReaderSource(reader.into()),
             scratch: Vec::new(),
             recurse: limit,
+            preserve_simple: false,
         }
     }
 
@@ -571,9 +600,10 @@ impl<'de> Deserializer<SliceSource<'de>> {
     /// `&[u8]` argument satisfies both constructors.
     pub fn from_slice_with_recursion_limit(slice: &'de [u8], limit: usize) -> Self {
         Self {
-            source: SliceSource(slice.into()),
+            source: SliceSource(slice.into(), slice),
             scratch: Vec::new(),
             recurse: limit,
+            preserve_simple: false,
         }
     }
 }
@@ -683,6 +713,19 @@ impl<S: Source> Deserializer<S> {
             len -= n;
         }
         Ok(())
+    }
+
+    fn float(&mut self) -> Result<f64, Error> {
+        loop {
+            if let Some(result) = self.source.float() {
+                return result;
+            }
+            return match self.source.pull()? {
+                Header::Tag(_) => continue,
+                Header::Float(value) => Ok(value),
+                header => Err(header.expected("float")),
+            };
+        }
     }
 
     fn unsigned(&mut self) -> Result<u128, Error> {
@@ -838,10 +881,12 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
         }
 
         if let Header::Simple(x) = header {
-            if !matches!(
-                x,
-                simple::FALSE | simple::TRUE | simple::NULL | simple::UNDEFINED
-            ) {
+            if (self.preserve_simple && x == simple::UNDEFINED)
+                || !matches!(
+                    x,
+                    simple::FALSE | simple::TRUE | simple::NULL | simple::UNDEFINED
+                )
+            {
                 let simple = crate::Simple::new(x).expect("decoder returns valid simple values");
                 return visitor.visit_enum(SimpleAccess::new(simple));
             }
@@ -895,22 +940,16 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
 
     #[inline]
     fn deserialize_f32<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        self.deserialize_f64(visitor)
+        let value = self.float()?;
+        match crate::core::f64_to_f32(value) {
+            Some(bits) => visitor.visit_f32(f32::from_bits(bits)),
+            None => visitor.visit_f64(value),
+        }
     }
 
     #[inline]
     fn deserialize_f64<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        loop {
-            if let Some(res) = self.source.float() {
-                return visitor.visit_f64(res?);
-            }
-
-            return match self.source.pull()? {
-                Header::Tag(..) => continue,
-                Header::Float(x) => visitor.visit_f64(x),
-                h => Err(h.expected("float")),
-            };
-        }
+        visitor.visit_f64(self.float()?)
     }
 
     fn deserialize_i8<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -1081,7 +1120,7 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
                 }
 
                 // Be liberal: accept an array of integers as bytes.
-                Header::Array(len) => self.recurse(|me| visitor.visit_seq(Access(me, len))),
+                Header::Array(len) => self.visit_array(len, visitor),
 
                 header => Err(header.expected("bytes")),
             };
@@ -1103,7 +1142,7 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
                 }
 
                 // Be liberal: accept an array of integers as bytes.
-                Header::Array(len) => self.recurse(|me| visitor.visit_seq(Access(me, len))),
+                Header::Array(len) => self.visit_array(len, visitor),
 
                 header => Err(header.expected("bytes")),
             };
@@ -1115,22 +1154,22 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
 
-                Header::Array(len) => self.recurse(|me| visitor.visit_seq(Access(me, len))),
+                Header::Array(len) => self.visit_array(len, visitor),
 
                 // Be liberal: accept a byte string as a sequence of integers.
                 Header::Bytes(Some(len)) => match self.source.borrow_body(len) {
-                    Some(res) => visitor.visit_seq(BorrowedBytesAccess(0, res?)),
+                    Some(res) => visit_byte_seq(res?, visitor),
                     None => {
                         let mut buffer = Vec::new();
                         self.source.bytes_body(Some(len), &mut buffer)?;
-                        visitor.visit_seq(BytesAccess(0, buffer))
+                        visit_byte_seq(&buffer, visitor)
                     }
                 },
 
                 Header::Bytes(None) => {
                     let mut buffer = Vec::new();
                     self.source.bytes_body(None, &mut buffer)?;
-                    visitor.visit_seq(BytesAccess(0, buffer))
+                    visit_byte_seq(&buffer, visitor)
                 }
 
                 header => Err(header.expected("array")),
@@ -1142,7 +1181,7 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
         loop {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
-                Header::Map(len) => self.recurse(|me| visitor.visit_map(Access(me, len))),
+                Header::Map(len) => self.visit_object(len, "", visitor),
                 header => Err(header.expected("map")),
             };
         }
@@ -1163,10 +1202,10 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
                 Header::Map(len) if marker.shape == crate::ser::StructShape::Map => {
-                    self.recurse(|me| visitor.visit_map(StructAccess(me, len, marker.keys)))
+                    self.visit_object(len, marker.keys, visitor)
                 }
                 Header::Array(len) if marker.shape == crate::ser::StructShape::Array => {
-                    self.recurse(|me| visitor.visit_seq(Access(me, len)))
+                    self.visit_array(len, visitor)
                 }
                 header if marker.shape == crate::ser::StructShape::Array => {
                     Err(header.expected("array"))
@@ -1321,6 +1360,15 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
         if name == crate::raw::NAME {
             return visitor.visit_byte_buf(self.capture_item()?);
         }
+        if name == crate::raw::BORROWED_NAME {
+            return match self.source.borrow_item(self.recurse) {
+                Some(bytes) => visitor.visit_borrowed_bytes(bytes?),
+                None => Err(Error::semantic(
+                    self.offset(),
+                    "raw item requires a borrowed source",
+                )),
+            };
+        }
 
         self.skip_struct_tags(name)?;
         visitor.visit_newtype_struct(self)
@@ -1390,112 +1438,142 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
 }
 
 #[cfg(feature = "alloc")]
-struct Access<'a, S>(&'a mut Deserializer<S>, Option<usize>);
+struct Access<'a, S> {
+    de: &'a mut Deserializer<S>,
+    remaining: Option<usize>,
+}
+
+#[cfg(feature = "alloc")]
+impl<S: Source> Access<'_, S> {
+    #[inline]
+    fn next(&mut self) -> Result<bool, Error> {
+        match self.remaining {
+            Some(0) => return Ok(false),
+            Some(n) => self.remaining = Some(n - 1),
+            None => match self.de.source.pull()? {
+                Header::Break => {
+                    self.remaining = Some(0);
+                    return Ok(false);
+                }
+                header => self.de.source.push(header),
+            },
+        }
+        Ok(true)
+    }
+
+    #[inline]
+    fn finish(self) -> Result<(), Error> {
+        match self.remaining {
+            Some(0) => Ok(()),
+            None if matches!(self.de.source.pull()?, Header::Break) => Ok(()),
+            _ => Err(Error::semantic(
+                self.de.offset(),
+                "unconsumed container elements",
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'de, S: BorrowSource<'de>> Deserializer<S> {
+    #[inline]
+    fn visit_array<V: de::Visitor<'de>>(
+        &mut self,
+        remaining: Option<usize>,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.recurse(|me| {
+            let mut access = Access { de: me, remaining };
+            let value = visitor.visit_seq(&mut access)?;
+            access.finish()?;
+            Ok(value)
+        })
+    }
+
+    #[inline]
+    fn visit_object<V: de::Visitor<'de>>(
+        &mut self,
+        remaining: Option<usize>,
+        keys: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.recurse(|me| {
+            let mut access = ObjectAccess {
+                base: Access { de: me, remaining },
+                pending_value: false,
+                keys,
+            };
+            let value = visitor.visit_map(&mut access)?;
+            if access.pending_value {
+                return Err(Error::semantic(
+                    access.base.de.offset(),
+                    "missing map value",
+                ));
+            }
+            access.base.finish()?;
+            Ok(value)
+        })
+    }
+}
 
 #[cfg(feature = "alloc")]
 impl<'de, S: BorrowSource<'de>> de::SeqAccess<'de> for Access<'_, S> {
     type Error = Error;
-
     #[inline]
     fn next_element_seed<U: de::DeserializeSeed<'de>>(
         &mut self,
         seed: U,
-    ) -> Result<Option<U::Value>, Self::Error> {
-        match self.1 {
-            Some(0) => return Ok(None),
-            Some(x) => self.1 = Some(x - 1),
-            None => match self.0.source.pull()? {
-                Header::Break => return Ok(None),
-                header => self.0.source.push(header),
-            },
+    ) -> Result<Option<U::Value>, Error> {
+        if !self.next()? {
+            return Ok(None);
         }
-
-        seed.deserialize(&mut *self.0).map(Some)
+        seed.deserialize(&mut *self.de).map(Some)
     }
-
     #[inline]
     fn size_hint(&self) -> Option<usize> {
-        self.1
+        self.remaining
     }
 }
 
 #[cfg(feature = "alloc")]
-impl<'de, S: BorrowSource<'de>> de::MapAccess<'de> for Access<'_, S> {
-    type Error = Error;
-
-    #[inline]
-    fn next_key_seed<K: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: K,
-    ) -> Result<Option<K::Value>, Self::Error> {
-        match self.1 {
-            Some(0) => return Ok(None),
-            Some(x) => self.1 = Some(x - 1),
-            None => match self.0.source.pull()? {
-                Header::Break => return Ok(None),
-                header => self.0.source.push(header),
-            },
-        }
-
-        seed.deserialize(&mut *self.0).map(Some)
-    }
-
-    #[inline]
-    fn next_value_seed<V: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
-    ) -> Result<V::Value, Self::Error> {
-        seed.deserialize(&mut *self.0)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> Option<usize> {
-        self.1
-    }
+struct ObjectAccess<'a, S> {
+    base: Access<'a, S>,
+    pending_value: bool,
+    keys: &'static str,
 }
 
-// Map access for a marked struct: integer keys translate to field names
-// through the `<field>=<key>` table of the container marker (see
-// [`STRUCT_MARKER`](crate::ser::STRUCT_MARKER)); everything else
-// deserializes as usual.
 #[cfg(feature = "alloc")]
-struct StructAccess<'a, S>(&'a mut Deserializer<S>, Option<usize>, &'static str);
-
-#[cfg(feature = "alloc")]
-impl<'de, S: BorrowSource<'de>> de::MapAccess<'de> for StructAccess<'_, S> {
+impl<'de, S: BorrowSource<'de>> de::MapAccess<'de> for ObjectAccess<'_, S> {
     type Error = Error;
-
+    #[inline]
     fn next_key_seed<K: de::DeserializeSeed<'de>>(
         &mut self,
         seed: K,
-    ) -> Result<Option<K::Value>, Self::Error> {
-        match self.1 {
-            Some(0) => return Ok(None),
-            Some(x) => self.1 = Some(x - 1),
-            None => match self.0.source.pull()? {
-                Header::Break => return Ok(None),
-                header => self.0.source.push(header),
-            },
+    ) -> Result<Option<K::Value>, Error> {
+        if self.pending_value {
+            return Err(Error::semantic(self.base.de.offset(), "expected map value"));
         }
-
+        if !self.base.next()? {
+            return Ok(None);
+        }
+        self.pending_value = true;
+        if self.keys.is_empty() {
+            return seed.deserialize(&mut *self.base.de).map(Some);
+        }
         loop {
-            let header = self.0.source.pull()?;
-            let key = match header {
+            let key = match self.base.de.source.pull()? {
                 Header::Tag(..) => continue,
                 Header::Positive(x) => i128::from(x),
                 Header::Negative(x) => -1 - i128::from(x),
                 header => {
-                    self.0.source.push(header);
-                    return seed.deserialize(&mut *self.0).map(Some);
+                    self.base.de.source.push(header);
+                    return seed.deserialize(&mut *self.base.de).map(Some);
                 }
             };
-
-            return match crate::ser::field_for_key(self.2, key) {
+            return match crate::ser::field_for_key(self.keys, key) {
                 Some(field) => seed
                     .deserialize(de::value::StrDeserializer::new(field))
                     .map(Some),
-                // An unmapped integer key takes the placeholder form, so
-                // it is an unknown field, exactly as in a plain struct.
                 None => seed
                     .deserialize(de::value::StringDeserializer::new(format!(
                         "{INT_KEY_PLACEHOLDER}{key}"
@@ -1504,18 +1582,20 @@ impl<'de, S: BorrowSource<'de>> de::MapAccess<'de> for StructAccess<'_, S> {
             };
         }
     }
-
     #[inline]
-    fn next_value_seed<V: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
-    ) -> Result<V::Value, Self::Error> {
-        seed.deserialize(&mut *self.0)
+    fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
+        if !self.pending_value {
+            return Err(Error::semantic(
+                self.base.de.offset(),
+                "map value requested before key",
+            ));
+        }
+        self.pending_value = false;
+        seed.deserialize(&mut *self.base.de)
     }
-
     #[inline]
     fn size_hint(&self) -> Option<usize> {
-        self.1
+        self.base.remaining
     }
 }
 
@@ -1645,11 +1725,11 @@ impl<'de, S: BorrowSource<'de>> de::VariantAccess<'de> for Enum<'_, S> {
         let value = loop {
             break match self.0.source.pull()? {
                 Header::Tag(..) => continue,
-                Header::Map(len) if shape == crate::ser::StructShape::Map => self
-                    .0
-                    .recurse(|me| visitor.visit_map(StructAccess(me, len, keys)))?,
+                Header::Map(len) if shape == crate::ser::StructShape::Map => {
+                    self.0.visit_object(len, keys, visitor)?
+                }
                 Header::Array(len) if shape == crate::ser::StructShape::Array => {
-                    self.0.recurse(|me| visitor.visit_seq(Access(me, len)))?
+                    self.0.visit_array(len, visitor)?
                 }
                 header if shape == crate::ser::StructShape::Array => {
                     return Err(header.expected("array"))
@@ -1662,34 +1742,18 @@ impl<'de, S: BorrowSource<'de>> de::VariantAccess<'de> for Enum<'_, S> {
     }
 }
 
-// Yields the contents of a byte string as a sequence of integers.
+// Byte strings accepted as sequences must obey the target's length too.
 #[cfg(feature = "alloc")]
-struct BytesAccess(usize, Vec<u8>);
-
-#[cfg(feature = "alloc")]
-impl<'de> de::SeqAccess<'de> for BytesAccess {
-    type Error = Error;
-
-    #[inline]
-    fn next_element_seed<U: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: U,
-    ) -> Result<Option<U::Value>, Self::Error> {
-        use de::IntoDeserializer;
-
-        if self.0 < self.1.len() {
-            let byte = self.1[self.0];
-            self.0 += 1;
-            seed.deserialize(byte.into_deserializer()).map(Some)
-        } else {
-            Ok(None)
-        }
+pub(crate) fn visit_byte_seq<'de, V: de::Visitor<'de>>(
+    bytes: &[u8],
+    visitor: V,
+) -> Result<V::Value, Error> {
+    let mut access = BorrowedBytesAccess(0, bytes);
+    let value = visitor.visit_seq(&mut access)?;
+    if access.0 != bytes.len() {
+        return Err(Error::semantic(None, "unconsumed byte string elements"));
     }
-
-    #[inline]
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.1.len() - self.0)
-    }
+    Ok(value)
 }
 
 // Yields the contents of a borrowed byte string as a sequence of integers.
@@ -1697,7 +1761,7 @@ impl<'de> de::SeqAccess<'de> for BytesAccess {
 struct BorrowedBytesAccess<'de>(usize, &'de [u8]);
 
 #[cfg(feature = "alloc")]
-impl<'de> de::SeqAccess<'de> for BorrowedBytesAccess<'de> {
+impl<'de> de::SeqAccess<'de> for BorrowedBytesAccess<'_> {
     type Error = Error;
 
     #[inline]
@@ -1766,8 +1830,7 @@ impl<T: de::DeserializeOwned, R: Read> Iterator for Iter<T, R> {
 /// Beyond well-formedness (RFC 8949 §5.3.1) this verifies that text strings
 /// are valid UTF-8 (every segment of an indefinite-length text string on
 /// its own, as the RFC requires). Unassigned simple values are accepted:
-/// they are well-formed, even though the serde interface has no
-/// representation for them.
+/// they are well-formed and can be represented by [`crate::Simple`].
 ///
 /// Trailing data after the item is an error; to handle a CBOR sequence
 /// (RFC 8742), validate items one at a time from the shared reader.
@@ -2103,6 +2166,15 @@ fn check_utf8_body<R: Read>(
 pub fn from_reader<T: de::DeserializeOwned, R: Read>(reader: R) -> Result<T, Error> {
     let mut deserializer = Deserializer::from_reader(reader);
     T::deserialize(&mut deserializer)
+}
+
+// Internal data-model consumers (CDN, deterministic encoding) must retain
+// undefined even though the public serde-visible Value decoder maps it to null.
+#[cfg(feature = "alloc")]
+pub(crate) fn value_from_slice(slice: &[u8]) -> Result<crate::Value, Error> {
+    let mut deserializer = Deserializer::from_slice(slice);
+    deserializer.preserve_simple = true;
+    de::Deserialize::deserialize(&mut deserializer)
 }
 
 /// Deserializes a value from a byte slice of CBOR.

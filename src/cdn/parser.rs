@@ -1,4 +1,5 @@
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
     vec::Vec,
@@ -9,15 +10,14 @@ use crate::de::{Error, DEFAULT_RECURSION_LIMIT};
 
 use super::applications::{
     append_indefinite_string_chunk, base64_content, concat_app_strings, concat_bytes, hex_atom,
-    hex_content, one_bytes_arg, one_text_arg, same_args, unresolved_app_sequence,
-    unresolved_app_string,
+    one_bytes_arg, one_text_arg, same_args, unresolved_app_sequence,
 };
-#[cfg(feature = "cdn")]
+#[cfg(feature = "cdn-cri")]
 use super::cri::cri_atom;
 use super::datetime::datetime_atom;
 use super::encode::{ellipsis_item, write_definite_bytes, write_definite_text, write_uint};
 use super::float::{f64_to_f16_preserving, float_atom};
-#[cfg(feature = "cdn")]
+#[cfg(feature = "cdn-hash")]
 use super::hash::{hash_args, hash_atom};
 use super::ip::ip_atom;
 use super::number::{
@@ -27,20 +27,54 @@ use super::number::{
 use super::types::{Arg, Atom, BigInt, Indicator};
 
 pub(super) fn item_to_vec(input: &str) -> Result<Vec<u8>, Error> {
-    let mut parser = Parser::new(input);
-    let mut out = Vec::new();
-    parser.skip_ws()?;
-    parser.item(&mut out, DEFAULT_RECURSION_LIMIT)?;
-    parser.skip_ws()?;
-    if !parser.eof() {
-        return Err(parser.syntax());
-    }
-    Ok(out)
+    normalized(input, |input| {
+        let mut parser = Parser::new(input);
+        let mut out = Vec::new();
+        parser.skip_ws()?;
+        parser.item(&mut out, DEFAULT_RECURSION_LIMIT)?;
+        parser.skip_ws()?;
+        if !parser.eof() {
+            return Err(parser.syntax());
+        }
+        Ok(out)
+    })
 }
 
 pub(super) fn sequence_to_vec(input: &str) -> Result<Vec<u8>, Error> {
-    let mut parser = Parser::new(input);
-    parser.sequence_to_vec(None, DEFAULT_RECURSION_LIMIT)
+    normalized(input, |input| {
+        Parser::new(input).sequence_to_vec(None, DEFAULT_RECURSION_LIMIT)
+    })
+}
+
+// CR is ignored before tokenization, while diagnostic offsets still name
+// bytes of the original source. An escaped \r is not removed here.
+fn normalized(
+    input: &str,
+    parse: impl FnOnce(&str) -> Result<Vec<u8>, Error>,
+) -> Result<Vec<u8>, Error> {
+    let text = if input.contains('\r') {
+        Cow::Owned(input.replace('\r', ""))
+    } else {
+        Cow::Borrowed(input)
+    };
+    parse(&text).map_err(|error| {
+        if matches!(text, Cow::Borrowed(_)) {
+            return error;
+        }
+        let offset = |pos: usize| {
+            input
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte != b'\r')
+                .nth(pos)
+                .map_or(input.len(), |(i, _)| i)
+        };
+        match error {
+            Error::Syntax(pos) => Error::Syntax(offset(pos)),
+            Error::Semantic(Some(pos), message) => Error::Semantic(Some(offset(pos)), message),
+            other => other,
+        }
+    })
 }
 
 pub(super) struct Parser<'a> {
@@ -226,8 +260,7 @@ impl<'a> Parser<'a> {
         loop {
             let mut encoded = Vec::new();
             self.item(&mut encoded, depth)?;
-            let value = crate::from_slice(&encoded[..])?;
-            args.push(Arg { encoded, value });
+            args.push(Arg::Encoded(encoded));
 
             let had_ws = self.consume_ws()?;
             if self.eat(",") {
@@ -301,7 +334,10 @@ impl<'a> Parser<'a> {
     fn array(&mut self, out: &mut Vec<u8>, depth: usize) -> Result<(), Error> {
         self.expect("[")?;
         let spec = self.parse_spec();
-        self.skip_ws()?;
+        let spaced = self.consume_ws()?;
+        if spec != Indicator::None && !spaced && !matches!(self.peek(), Some(']' | '}')) {
+            return Err(self.syntax());
+        }
 
         let indefinite = spec == Indicator::Indefinite;
         if indefinite {
@@ -363,7 +399,10 @@ impl<'a> Parser<'a> {
     fn map(&mut self, out: &mut Vec<u8>, depth: usize) -> Result<(), Error> {
         self.expect("{")?;
         let spec = self.parse_spec();
-        self.skip_ws()?;
+        let spaced = self.consume_ws()?;
+        if spec != Indicator::None && !spaced && !matches!(self.peek(), Some(']' | '}')) {
+            return Err(self.syntax());
+        }
 
         let indefinite = spec == Indicator::Indefinite;
         if indefinite {
@@ -888,7 +927,11 @@ impl<'a> Parser<'a> {
         let mut content = &self.input[content_start..content_end];
         self.pos = content_end + width;
 
-        if content.is_empty() {
+        if content.is_empty()
+            || content
+                .chars()
+                .any(|ch| ch.is_ascii_control() && !matches!(ch, '\n' | '\r'))
+        {
             return Err(self.syntax());
         }
         if let Some(stripped) = content.strip_prefix("\r\n") {
@@ -903,39 +946,7 @@ impl<'a> Parser<'a> {
     }
 
     fn apply_app_string(&self, prefix: &str, content: String) -> Result<Atom, Error> {
-        match prefix {
-            "h" => hex_atom(&content, self.pos),
-            "b64" => Ok(Atom::Bytes(base64_content(&content, self.pos)?)),
-            "dt" => datetime_atom(&content, false, self.pos),
-            "DT" => datetime_atom(&content, true, self.pos),
-            "ip" => ip_atom(&content, false, self.pos),
-            "IP" => ip_atom(&content, true, self.pos),
-            #[cfg(feature = "cdn")]
-            "hash" => hash_atom(content.into_bytes(), None, self.pos),
-            #[cfg(feature = "cdn")]
-            "cri" => cri_atom(&content, false, self.pos),
-            #[cfg(feature = "cdn")]
-            "CRI" => cri_atom(&content, true, self.pos),
-            "b1" => Ok(Atom::Bytes(content.into_bytes())),
-            "t1" => Ok(Atom::Text(content)),
-            "ilbs" => {
-                let mut out = Vec::new();
-                out.push(0x5f);
-                write_definite_bytes(&mut out, content.as_bytes(), Indicator::None)?;
-                out.push(0xff);
-                Ok(Atom::Raw(out))
-            }
-            "ilts" => {
-                let mut out = Vec::new();
-                out.push(0x7f);
-                write_definite_text(&mut out, &content, Indicator::None)?;
-                out.push(0xff);
-                Ok(Atom::Raw(out))
-            }
-            "bytes" => Ok(Atom::Bytes(content.into_bytes())),
-            "float" => float_atom(hex_content(&content, self.pos)?, self.pos),
-            _ => unresolved_app_string(prefix, content, self.pos),
-        }
+        self.apply_app_sequence(prefix, alloc::vec![Arg::Text(content)])
     }
 
     fn apply_app_sequence(&self, prefix: &str, args: Vec<Arg>) -> Result<Atom, Error> {
@@ -973,12 +984,12 @@ impl<'a> Parser<'a> {
                     Ok(Atom::Bytes(base64_content(&content, self.pos)?))
                 }
             }
-            #[cfg(feature = "cdn")]
+            #[cfg(feature = "cdn-hash")]
             "hash" => {
                 let (data, alg) = hash_args(args, self.pos)?;
                 hash_atom(data, alg, self.pos)
             }
-            #[cfg(feature = "cdn")]
+            #[cfg(feature = "cdn-cri")]
             "cri" | "CRI" => {
                 let content = one_text_arg(prefix, args, self.pos)?;
                 cri_atom(&content, prefix == "CRI", self.pos)

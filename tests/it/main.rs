@@ -24,3 +24,11 @@ mod validate;
 mod value;
 mod value_api;
 mod value_serde;
+
+mod audit_regressions;
+
+#[cfg(feature = "derive")]
+mod derive_compile;
+
+#[cfg(all(feature = "alloc", feature = "std"))]
+mod audit_crosscheck;

@@ -53,7 +53,9 @@ fn main() {
         "cbor4ii",
         cbor4ii::serde::to_vec(Vec::new(), &ints).unwrap().len(),
         cbor4ii::serde::to_vec(Vec::new(), &logs).unwrap().len(),
-        cbor4ii::serde::to_vec(Vec::new(), &blob_serde).unwrap().len(),
+        cbor4ii::serde::to_vec(Vec::new(), &blob_serde)
+            .unwrap()
+            .len(),
     );
     row(
         "minicbor",

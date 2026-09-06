@@ -38,7 +38,11 @@ std = ["alloc", "serde/std"]
 alloc = ["serde/alloc"]
 # Enables CDN input extensions that need external crates: cryptographic hash
 # literals and CRI literals.
-cdn = ["alloc", "dep:iref", "dep:sha2", "dep:shake"]
+cdn = ["cdn-hash", "cdn-cri"]
+# Hash extensions also work on no_std + alloc targets.
+cdn-hash = ["alloc", "dep:sha2", "dep:shake"]
+# iref requires std, independently of its own default feature settings.
+cdn-cri = ["std", "dep:iref"]
 # Enables #[derive(cbor2::Cbor)] for integer map keys and CBOR tags.
 derive = ["dep:cbor2-derive", "serde/derive"]
 # Adapts async_io helpers to futures_io::AsyncRead/AsyncWrite.

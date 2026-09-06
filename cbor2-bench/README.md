@@ -248,6 +248,19 @@ decode.
 
 <!-- RESULTS:END -->
 
+## Focused regression workloads
+
+`cargo bench --bench focused` covers raw-item encode/decode/sizing,
+canonical integer and compound keys, CDN integers at several sizes, flattened
+records and 1,024-chunk strings. The fixtures keep the same logical and wire
+shape when comparing revisions. `parse_results.py` also emits these results
+and includes the `validate_slice` structural-scan column.
+
+Allocation contracts are exercised by `cargo test -p cbor2 --all-features
+--test allocations`: raw sizing and caller-buffer writes allocate zero bytes,
+slice capture allocates one copy, and an array-shaped Value allocates one
+container. Timing and allocation results should be assessed separately.
+
 ## Caveats
 
 - Each crate is benchmarked on **its own idiomatic encoding**, not on

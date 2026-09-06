@@ -10,7 +10,7 @@ use super::{Error, Integer, Value};
 ///
 /// RFC 8949 defines two deterministic key orderings. They agree whenever
 /// all keys encode to the same length, but differ otherwise: for example,
-/// `100` (`0x1864`) sorts after `-1` (`0x20`) bytewise, but before it
+/// `100` (`0x1864`) sorts before `-1` (`0x20`) bytewise, but after it
 /// length-first.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
 #[non_exhaustive]
@@ -82,81 +82,256 @@ impl Value {
     /// let keys: Vec<_> = value.as_map().unwrap().iter().map(|(k, _)| k).collect();
     /// assert_eq!(keys, [&Value::from(-1), &Value::from(100), &Value::from("aa")]);
     /// ```
+    /// On error, this value is left unchanged.
     pub fn canonicalize_with(&mut self, order: KeyOrder) -> Result<(), Error> {
-        match self {
-            Value::Float(x) if x.is_nan() => *x = f64::NAN,
-
-            Value::Array(items) => {
-                for item in items {
-                    item.canonicalize_with(order)?;
-                }
-            }
-
-            Value::Tag(tag @ (2 | 3), inner) => {
-                inner.canonicalize_with(order)?;
-                let tag = *tag;
-
-                // Preferred serialization of a bignum: no leading zeros,
-                // and major type 0/1 whenever the value fits.
-                let reduced = match inner.as_mut() {
-                    Value::Bytes(bytes) => {
-                        let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
-                        bytes.drain(..first);
-
-                        if bytes.len() <= 8 {
-                            let mut buffer = [0u8; 8];
-                            buffer[8 - bytes.len()..].copy_from_slice(bytes);
-                            let raw = u64::from_be_bytes(buffer);
-
-                            Some(match tag {
-                                2 => Integer::from(raw),
-                                _ => Integer::try_from(-1i128 - i128::from(raw))
-                                    .expect("-1 - u64 is always in range"),
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-
-                if let Some(int) = reduced {
-                    *self = Value::Integer(int);
-                }
-            }
-
-            Value::Tag(.., inner) => inner.canonicalize_with(order)?,
-
-            Value::Map(entries) => {
-                let mut keyed = Vec::with_capacity(entries.len());
-                for (mut key, mut val) in core::mem::take(entries) {
-                    key.canonicalize_with(order)?;
-                    val.canonicalize_with(order)?;
-
-                    // Encoding a Value into a Vec cannot actually fail;
-                    // the error mapping is purely defensive.
-                    let encoded = crate::ser::to_vec(&key).map_err(Error::custom)?;
-                    keyed.push((encoded, key, val));
-                }
-
-                keyed.sort_by(|a, b| match order {
-                    KeyOrder::Bytewise => a.0.cmp(&b.0),
-                    KeyOrder::LengthFirst => a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)),
-                });
-
-                // Equal keys are adjacent in either order.
-                for window in keyed.windows(2) {
-                    if window[0].0 == window[1].0 {
-                        return Err(Error::custom("duplicate map key"));
-                    }
-                }
-
-                entries.extend(keyed.into_iter().map(|(_, key, val)| (key, val)));
-            }
-
-            _ => {}
-        }
-
+        let mut plans = Vec::new();
+        prepare(self, order, &mut plans, crate::de::DEFAULT_RECURSION_LIMIT)
+            .map_err(Error::custom)?;
+        normalize(self, &mut plans.into_iter());
         Ok(())
     }
+}
+
+struct Entry<'a> {
+    encoded: core::ops::Range<usize>,
+    equivalent: core::ops::Range<usize>,
+    value: &'a Value,
+    original: usize,
+}
+
+// One byte arena per map, instead of a separate allocation for every key.
+fn ordered<'a>(
+    pairs: &'a [(Value, Value)],
+    order: KeyOrder,
+    zero: bool,
+    depth: usize,
+) -> Result<(Vec<u8>, Vec<Entry<'a>>), crate::ser::Error> {
+    let mut arena = Vec::new();
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (original, (key, value)) in pairs.iter().enumerate() {
+        let start = arena.len();
+        encode(
+            key,
+            &mut crate::core::Encoder::from(&mut arena),
+            order,
+            zero,
+            depth,
+        )?;
+        let encoded = start..arena.len();
+        let equivalent = if !zero && has_negative_zero(key) {
+            let start = arena.len();
+            encode(
+                key,
+                &mut crate::core::Encoder::from(&mut arena),
+                order,
+                true,
+                depth,
+            )?;
+            start..arena.len()
+        } else {
+            encoded.clone()
+        };
+        entries.push(Entry {
+            encoded,
+            equivalent,
+            value,
+            original,
+        });
+    }
+    // Equality may differ from wire order (notably for negative zero).
+    entries.sort_unstable_by(|a, b| arena[a.equivalent.clone()].cmp(&arena[b.equivalent.clone()]));
+    if entries
+        .windows(2)
+        .any(|w| arena[w[0].equivalent.clone()] == arena[w[1].equivalent.clone()])
+    {
+        return Err(crate::ser::Error::msg("duplicate map key"));
+    }
+    entries.sort_unstable_by(|a, b| {
+        let a = &arena[a.encoded.clone()];
+        let b = &arena[b.encoded.clone()];
+        match order {
+            KeyOrder::Bytewise => a.cmp(b),
+            KeyOrder::LengthFirst => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+        }
+    });
+    Ok((arena, entries))
+}
+
+fn has_negative_zero(value: &Value) -> bool {
+    match value {
+        Value::Float(x) => x.to_bits() == (-0.0f64).to_bits(),
+        Value::Array(items) => items.iter().any(has_negative_zero),
+        Value::Map(items) => items
+            .iter()
+            .any(|(k, v)| has_negative_zero(k) || has_negative_zero(v)),
+        Value::Tag(_, inner) => has_negative_zero(inner),
+        _ => false,
+    }
+}
+
+// Validate before changing the value; retain only map permutations, not
+// cloned payloads. Plans are consumed in the same postorder by normalize.
+fn prepare(
+    value: &Value,
+    order: KeyOrder,
+    plans: &mut Vec<Vec<usize>>,
+    depth: usize,
+) -> Result<(), crate::ser::Error> {
+    if depth == 0 {
+        return Err(crate::ser::Error::msg("recursion limit exceeded"));
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                prepare(item, order, plans, depth - 1)?;
+            }
+        }
+        Value::Tag(_, inner) => prepare(inner, order, plans, depth - 1)?,
+        Value::Map(pairs) => {
+            for (key, value) in pairs {
+                prepare(key, order, plans, depth - 1)?;
+                prepare(value, order, plans, depth - 1)?;
+            }
+            let (_, entries) = ordered(pairs, order, false, depth - 1)?;
+            let mut permutation = alloc::vec![0; entries.len()];
+            for (destination, entry) in entries.iter().enumerate() {
+                permutation[entry.original] = destination;
+            }
+            plans.push(permutation);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn normalize(value: &mut Value, plans: &mut alloc::vec::IntoIter<Vec<usize>>) {
+    match value {
+        Value::Float(x) if x.is_nan() => *x = f64::NAN,
+        Value::Array(items) => {
+            for item in items {
+                normalize(item, plans);
+            }
+        }
+        Value::Tag(tag, inner) => {
+            normalize(inner, plans);
+            if matches!(*tag, 2 | 3) {
+                if let Value::Bytes(bytes) = inner.as_mut() {
+                    let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+                    bytes.drain(..first);
+                    if let Some(integer) = small_bignum(*tag, bytes) {
+                        *value = Value::Integer(integer);
+                    }
+                }
+            }
+        }
+        Value::Map(pairs) => {
+            for (key, value) in pairs.iter_mut() {
+                normalize(key, plans);
+                normalize(value, plans);
+            }
+            let mut permutation = plans.next().expect("validated map has a permutation");
+            for i in 0..permutation.len() {
+                while permutation[i] != i {
+                    let destination = permutation[i];
+                    pairs.swap(i, destination);
+                    permutation.swap(i, destination);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn small_bignum(tag: u64, bytes: &[u8]) -> Option<Integer> {
+    if bytes.len() > 8 {
+        return None;
+    }
+    let mut raw = [0u8; 8];
+    raw[8 - bytes.len()..].copy_from_slice(bytes);
+    let raw = u64::from_be_bytes(raw);
+    Some(if tag == 2 {
+        Integer::from(raw)
+    } else {
+        Integer::try_from(-1 - i128::from(raw)).expect("CBOR negative range")
+    })
+}
+
+pub(crate) fn to_writer<W: crate::io::Write>(
+    value: &Value,
+    writer: W,
+    order: KeyOrder,
+) -> Result<(), crate::ser::Error> {
+    encode(
+        value,
+        &mut crate::core::Encoder::from(writer),
+        order,
+        false,
+        crate::de::DEFAULT_RECURSION_LIMIT,
+    )
+}
+
+fn encode<W: crate::io::Write>(
+    value: &Value,
+    enc: &mut crate::core::Encoder<W>,
+    order: KeyOrder,
+    zero: bool,
+    depth: usize,
+) -> Result<(), crate::ser::Error> {
+    if depth == 0 {
+        return Err(crate::ser::Error::msg("recursion limit exceeded"));
+    }
+    match value {
+        Value::Integer(integer) => {
+            let integer = i128::from(*integer);
+            if integer < 0 {
+                enc.negative((-1 - integer) as u64)?;
+            } else {
+                enc.positive(integer as u64)?;
+            }
+        }
+        Value::Bytes(bytes) => enc.bytes(bytes)?,
+        Value::Text(text) => enc.text(text)?,
+        Value::Bool(value) => enc.simple(if *value { 21 } else { 20 })?,
+        Value::Null => enc.simple(22)?,
+        Value::Simple(value) => enc.simple(value.value())?,
+        Value::Float(value) => enc.float(if value.is_nan() {
+            f64::NAN
+        } else if zero && *value == 0.0 {
+            0.0
+        } else {
+            *value
+        })?,
+        Value::Tag(tag @ (2 | 3), inner) if matches!(inner.as_ref(), Value::Bytes(_)) => {
+            let Value::Bytes(bytes) = inner.as_ref() else {
+                unreachable!()
+            };
+            let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            let bytes = &bytes[first..];
+            if let Some(integer) = small_bignum(*tag, bytes) {
+                encode(&Value::Integer(integer), enc, order, zero, depth)?;
+            } else {
+                enc.tag(*tag)?;
+                enc.bytes(bytes)?;
+            }
+        }
+        Value::Tag(tag, inner) => {
+            enc.tag(*tag)?;
+            encode(inner, enc, order, zero, depth - 1)?;
+        }
+        Value::Array(items) => {
+            enc.array(Some(items.len()))?;
+            for item in items {
+                encode(item, enc, order, zero, depth - 1)?;
+            }
+        }
+        Value::Map(pairs) => {
+            let (arena, entries) = ordered(pairs, order, zero, depth - 1)?;
+            enc.map(Some(entries.len()))?;
+            for entry in entries {
+                enc.write_all(&arena[entry.encoded])?;
+                encode(entry.value, enc, order, zero, depth - 1)?;
+            }
+        }
+    }
+    Ok(())
 }

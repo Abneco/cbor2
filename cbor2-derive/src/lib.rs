@@ -18,13 +18,12 @@
 //! array shape as runtime metadata. The original Rust field names stay intact
 //! for JSON and other serde formats.
 //!
-//! A type using `#[serde(flatten)]` takes a buffered code path that
-//! dispatches on `is_human_readable()`: human-readable formats (JSON, ...)
-//! see the plain field names, while non-human-readable formats are routed
-//! through a dynamic `cbor2::Value` to remap the integer keys. That routing
-//! assumes the binary format is self-describing like CBOR; flattened types
-//! are not supported in non-self-describing binary formats such as bincode.
-//! Types without `#[serde(flatten)]` have no such restriction.
+//! A type using `#[serde(flatten)]` dispatches on `is_human_readable()`:
+//! human-readable formats see the plain serde representation. For cbor2,
+//! serialization buffers one encoded map and remaps only its keys; decoding
+//! passes fields directly to their visitors, preserving borrowed fields,
+//! simple values and raw item encodings. Other binary serializers are not
+//! supported by this internal raw-item protocol.
 //!
 //! ```ignore
 //! use cbor2::Cbor;
@@ -49,6 +48,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned as _;
+use syn::visit_mut::{self, VisitMut};
 
 // The marker prefix recognized by the `cbor2` serializers. Keep in sync
 // with `cbor2::ser::STRUCT_MARKER`; the integration tests of the `cbor2`
@@ -102,6 +102,11 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
     let mut flatten = false;
     match &input.data {
         syn::Data::Struct(data) => {
+            if container.array.is_some()
+                || matches!(&data.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() > 1)
+            {
+                validate_positional_fields(&data.fields)?;
+            }
             for entry in field_entries(&data.fields)? {
                 merge_entry(&mut entries, entry)?;
             }
@@ -159,6 +164,10 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
             }
 
             for variant in &data.variants {
+                if matches!(&variant.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() > 1)
+                {
+                    validate_positional_fields(&variant.fields)?;
+                }
                 if let Some(attr) = variant.attrs.iter().find(|a| a.path().is_ident("cbor")) {
                     return Err(syn::Error::new(
                         attr.span(),
@@ -277,6 +286,8 @@ fn generate(
 
     let mut shadow = input.clone();
     shadow.ident = shadow_ident.clone();
+    let (_, original_args, _) = input.generics.split_for_impl();
+    let original: syn::Path = syn::parse_quote!(#ident #original_args);
     shadow.attrs = copied_attrs(&input.attrs);
     match &mut shadow.data {
         syn::Data::Struct(data) => {
@@ -303,15 +314,46 @@ fn generate(
     let remote = ident.to_string();
 
     let mut head = vec![
-        syn::parse_quote!(#[derive(::serde::Serialize, ::serde::Deserialize)]),
+        syn::parse_quote!(#[derive(::cbor2::__serde::Serialize, ::cbor2::__serde::Deserialize)]),
         syn::parse_quote!(#[serde(remote = #remote)]),
         syn::parse_quote!(#[automatically_derived]),
     ];
     if let Some(marker) = marker(tag, array, entries, ident) {
         head.push(syn::parse_quote!(#[serde(rename = #marker)]));
     }
+    if !scan_serde(&input.attrs).explicit_crate {
+        head.push(syn::parse_quote!(#[serde(crate = "::cbor2::__serde")]));
+    }
     head.append(&mut shadow.attrs);
     shadow.attrs = head;
+    ReplaceSelf { original }.visit_derive_input_mut(&mut shadow);
+    if scan_serde(&input.attrs).default {
+        let mut path: syn::Path = syn::parse_quote!(#ident #ty_generics);
+        if let syn::PathArguments::AngleBracketed(args) =
+            &mut path.segments.last_mut().unwrap().arguments
+        {
+            args.colon2_token = Some(Default::default());
+        }
+        path.segments.push(syn::parse_quote!(default));
+        let path = quote!(#path).to_string();
+        for attr in &mut shadow.attrs {
+            if !attr.path().is_ident("serde") {
+                continue;
+            }
+            if let Ok(mut metas) = attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) {
+                for meta in &mut metas {
+                    if matches!(meta, syn::Meta::Path(p) if p.is_ident("default")) {
+                        *meta = syn::parse_quote!(default = #path);
+                    }
+                }
+                if let syn::Meta::List(list) = &mut attr.meta {
+                    list.tokens = quote!(#metas);
+                }
+            }
+        }
+    }
 
     // `T: Serialize` / `T: Deserialize<'de>` bounds, like serde's derive —
     // unless a container-level `#[serde(bound = ...)]` replaces them, just
@@ -324,7 +366,9 @@ fn generate(
             .extend(predicates.iter().cloned()),
         None => {
             for param in ser_generics.type_params_mut() {
-                param.bounds.push(syn::parse_quote!(::serde::Serialize));
+                param
+                    .bounds
+                    .push(syn::parse_quote!(::cbor2::__serde::Serialize));
             }
         }
     }
@@ -349,9 +393,15 @@ fn generate(
             for param in de_generics.type_params_mut() {
                 param
                     .bounds
-                    .push(syn::parse_quote!(::serde::Deserialize<#de_lifetime>));
+                    .push(syn::parse_quote!(::cbor2::__serde::Deserialize<#de_lifetime>));
             }
         }
+    }
+    if scan_serde(&input.attrs).default {
+        de_generics
+            .make_where_clause()
+            .predicates
+            .push(syn::parse_quote!(#ident #ty_generics: ::core::default::Default));
     }
     let mut de_lifetime_param = syn::LifetimeParam::new(de_lifetime.clone());
     de_lifetime_param
@@ -361,6 +411,52 @@ fn generate(
         .params
         .insert(0, syn::GenericParam::Lifetime(de_lifetime_param));
     let (de_impl_generics, _, de_where_clause) = de_generics.split_for_impl();
+
+    if scan_serde(&input.attrs).default {
+        // The remote visitor constructs the original type. Express its
+        // Default bound directly instead of serde's inferred shadow bound.
+        let mut predicates = de_generics
+            .where_clause
+            .as_ref()
+            .map(|w| w.predicates.clone())
+            .unwrap_or_default();
+        for param in de_generics.type_params() {
+            let name = &param.ident;
+            let bounds = &param.bounds;
+            if !bounds.is_empty() {
+                predicates.push(syn::parse_quote!(#name: #bounds));
+            }
+        }
+        let serde_de_lifetime = syn::Lifetime::new("'de", proc_macro2::Span::call_site());
+        let de_text =
+            rename_lifetime(quote!(#predicates), &de_lifetime, &serde_de_lifetime).to_string();
+        for attr in &mut shadow.attrs {
+            if !attr.path().is_ident("serde") {
+                continue;
+            }
+            if let Ok(metas) = attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) {
+                let kept: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]> = metas
+                    .into_iter()
+                    .filter(|m| !m.path().is_ident("bound"))
+                    .collect();
+                if let syn::Meta::List(list) = &mut attr.meta {
+                    list.tokens = quote!(#kept);
+                }
+            }
+        }
+        if let Some(ser_bound) = ser_bound {
+            let ser_text = quote!(#ser_bound).to_string();
+            shadow.attrs.push(
+                syn::parse_quote!(#[serde(bound(serialize = #ser_text, deserialize = #de_text))]),
+            );
+        } else {
+            shadow
+                .attrs
+                .push(syn::parse_quote!(#[serde(bound(deserialize = #de_text))]));
+        }
+    }
 
     let serde_impls = if flatten {
         let cbor_lifetime = fresh_lifetime(&input.generics, "__cbor");
@@ -386,10 +482,10 @@ fn generate(
                 value: &#cbor_lifetime #ident #ty_generics,
             }
 
-            impl #ser_ref_impl_generics ::serde::Serialize for __CborShadowRef #ser_ref_ty_generics #ser_ref_where_clause {
+            impl #ser_ref_impl_generics ::cbor2::__serde::Serialize for __CborShadowRef #ser_ref_ty_generics #ser_ref_where_clause {
                 fn serialize<__S>(&self, serializer: __S) -> ::core::result::Result<__S::Ok, __S::Error>
                 where
-                    __S: ::serde::Serializer,
+                    __S: ::cbor2::__serde::Serializer,
                 {
                     #shadow_ident::serialize(self.value, serializer)
                 }
@@ -397,57 +493,46 @@ fn generate(
 
             struct __CborShadowOwned #impl_generics (#ident #ty_generics) #where_clause;
 
-            impl #de_impl_generics ::serde::Deserialize<#de_lifetime> for __CborShadowOwned #ty_generics #de_where_clause {
+            impl #de_impl_generics ::cbor2::__serde::Deserialize<#de_lifetime> for __CborShadowOwned #ty_generics #de_where_clause {
                 fn deserialize<__D>(deserializer: __D) -> ::core::result::Result<Self, __D::Error>
                 where
-                    __D: ::serde::Deserializer<#de_lifetime>,
+                    __D: ::cbor2::__serde::Deserializer<#de_lifetime>,
                 {
                     #shadow_ident::deserialize(deserializer).map(Self)
                 }
             }
 
             #[automatically_derived]
-            impl #ser_impl_generics ::serde::Serialize for #ident #ty_generics #ser_where_clause {
+            impl #ser_impl_generics ::cbor2::__serde::Serialize for #ident #ty_generics #ser_where_clause {
                 fn serialize<__S>(&self, serializer: __S) -> ::core::result::Result<__S::Ok, __S::Error>
                 where
-                    __S: ::serde::Serializer,
+                    __S: ::cbor2::__serde::Serializer,
                 {
                     if serializer.is_human_readable() {
                         return #shadow_ident::serialize(self, serializer);
                     }
 
-                    let __value = ::cbor2::Value::serialized(&__CborShadowRef { value: self })
-                        .map_err(::serde::ser::Error::custom)?;
-                    let __value = ::cbor2::__private::__cbor2_flatten_serialize(
-                        __value,
+                    ::cbor2::__private::flatten_serialize(
+                        &__CborShadowRef { value: self }, serializer,
                         <#ident #ty_generics as ::cbor2::Cbor>::TAG,
                         <#ident #ty_generics as ::cbor2::Cbor>::KEYS,
                     )
-                    .map_err(::serde::ser::Error::custom)?;
-                    ::serde::Serialize::serialize(&__value, serializer)
                 }
             }
 
             #[automatically_derived]
-            impl #de_impl_generics ::serde::Deserialize<#de_lifetime> for #ident #ty_generics #de_where_clause {
+            impl #de_impl_generics ::cbor2::__serde::Deserialize<#de_lifetime> for #ident #ty_generics #de_where_clause {
                 fn deserialize<__D>(deserializer: __D) -> ::core::result::Result<Self, __D::Error>
                 where
-                    __D: ::serde::Deserializer<#de_lifetime>,
+                    __D: ::cbor2::__serde::Deserializer<#de_lifetime>,
                 {
                     if deserializer.is_human_readable() {
                         return #shadow_ident::deserialize(deserializer);
                     }
 
-                    let __value: ::cbor2::Value =
-                        ::serde::Deserialize::deserialize(deserializer)?;
-                    let __value = ::cbor2::__private::__cbor2_flatten_deserialize(
-                        __value,
-                        <#ident #ty_generics as ::cbor2::Cbor>::KEYS,
-                    )
-                    .map_err(::serde::de::Error::custom)?;
-                    let __value: __CborShadowOwned #ty_generics =
-                        ::cbor2::__private::__cbor2_flatten_deserialize_value(&__value)
-                        .map_err(::serde::de::Error::custom)?;
+                    let __value: __CborShadowOwned #ty_generics = ::cbor2::__private::flatten_deserialize(
+                        deserializer, <#ident #ty_generics as ::cbor2::Cbor>::KEYS,
+                    )?;
                     ::core::result::Result::Ok(__value.0)
                 }
             }
@@ -455,20 +540,20 @@ fn generate(
     } else {
         quote! {
             #[automatically_derived]
-            impl #ser_impl_generics ::serde::Serialize for #ident #ty_generics #ser_where_clause {
+            impl #ser_impl_generics ::cbor2::__serde::Serialize for #ident #ty_generics #ser_where_clause {
                 fn serialize<__S>(&self, serializer: __S) -> ::core::result::Result<__S::Ok, __S::Error>
                 where
-                    __S: ::serde::Serializer,
+                    __S: ::cbor2::__serde::Serializer,
                 {
                     #shadow_ident::serialize(self, serializer)
                 }
             }
 
             #[automatically_derived]
-            impl #de_impl_generics ::serde::Deserialize<#de_lifetime> for #ident #ty_generics #de_where_clause {
+            impl #de_impl_generics ::cbor2::__serde::Deserialize<#de_lifetime> for #ident #ty_generics #de_where_clause {
                 fn deserialize<__D>(deserializer: __D) -> ::core::result::Result<Self, __D::Error>
                 where
-                    __D: ::serde::Deserializer<#de_lifetime>,
+                    __D: ::cbor2::__serde::Deserializer<#de_lifetime>,
                 {
                     #shadow_ident::deserialize(deserializer)
                 }
@@ -492,7 +577,6 @@ fn generate(
         #[doc(hidden)]
         const _: () = {
             #shadow
-
             #serde_impls
 
             #[automatically_derived]
@@ -502,6 +586,76 @@ fn generate(
                 const ARRAY: bool = #array_const;
             }
         };
+    }
+}
+
+fn validate_positional_fields(fields: &syn::Fields) -> syn::Result<()> {
+    for field in fields {
+        let attrs = scan_serde(&field.attrs);
+        if attrs.skip.is_none() {
+            if let Some(span) = attrs.positional_skip {
+                return Err(syn::Error::new(span, "conditional or one-directional skipping changes CBOR array field positions; use an Option placeholder or #[serde(skip)]"));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ReplaceSelf {
+    original: syn::Path,
+}
+impl VisitMut for ReplaceSelf {
+    fn visit_path_mut(&mut self, path: &mut syn::Path) {
+        if path.leading_colon.is_none() && path.segments.first().is_some_and(|s| s.ident == "Self")
+        {
+            let suffix = path.segments.iter().skip(1).cloned().collect::<Vec<_>>();
+            *path = self.original.clone();
+            if !suffix.is_empty() {
+                if let syn::PathArguments::AngleBracketed(args) =
+                    &mut path.segments.last_mut().unwrap().arguments
+                {
+                    args.colon2_token = Some(Default::default());
+                }
+            }
+            path.segments.extend(suffix);
+        }
+        visit_mut::visit_path_mut(self, path);
+    }
+    fn visit_attribute_mut(&mut self, attr: &mut syn::Attribute) {
+        if attr.path().is_ident("serde") {
+            if let Ok(mut metas) = attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) {
+                for meta in &mut metas {
+                    if let syn::Meta::NameValue(meta) = meta {
+                        if [
+                            "default",
+                            "with",
+                            "serialize_with",
+                            "deserialize_with",
+                            "skip_serializing_if",
+                        ]
+                        .iter()
+                        .any(|name| meta.path.is_ident(name))
+                        {
+                            if let syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(lit),
+                                ..
+                            }) = &mut meta.value
+                            {
+                                if let Ok(mut path) = lit.parse::<syn::Path>() {
+                                    self.visit_path_mut(&mut path);
+                                    *lit = syn::LitStr::new(&quote!(#path).to_string(), lit.span());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let syn::Meta::List(list) = &mut attr.meta {
+                    list.tokens = quote!(#metas);
+                }
+            }
+        }
     }
 }
 
@@ -841,6 +995,9 @@ struct SerdeAttrs {
     de_bound: Option<BoundPredicates>,
     // `#[serde(skip)]`: the field is never on the wire in either direction.
     skip: Option<proc_macro2::Span>,
+    positional_skip: Option<proc_macro2::Span>,
+    default: bool,
+    explicit_crate: bool,
 }
 
 type BoundPredicates = syn::punctuated::Punctuated<syn::WherePredicate, syn::Token![,]>;
@@ -866,6 +1023,13 @@ impl Parse for ParsedBound {
 // punct followed by an ident; groups are walked recursively. Renaming is
 // uniform, so a `for<'de> ...` binder in a bound string stays consistent.
 fn rename_de_lifetime(tokens: TokenStream, to: &syn::Lifetime) -> TokenStream {
+    let from = syn::Lifetime::new("'de", proc_macro2::Span::call_site());
+    rename_lifetime(tokens, &from, to)
+}
+
+// Renames one lifetime token without touching longer user names that merely
+// share its prefix.
+fn rename_lifetime(tokens: TokenStream, from: &syn::Lifetime, to: &syn::Lifetime) -> TokenStream {
     use proc_macro2::{Group, Spacing, TokenTree};
 
     let mut out = TokenStream::new();
@@ -873,7 +1037,7 @@ fn rename_de_lifetime(tokens: TokenStream, to: &syn::Lifetime) -> TokenStream {
     while let Some(token) = iter.next() {
         match token {
             TokenTree::Group(group) => {
-                let inner = rename_de_lifetime(group.stream(), to);
+                let inner = rename_lifetime(group.stream(), from, to);
                 let mut renamed = Group::new(group.delimiter(), inner);
                 renamed.set_span(group.span());
                 out.extend([TokenTree::Group(renamed)]);
@@ -882,7 +1046,7 @@ fn rename_de_lifetime(tokens: TokenStream, to: &syn::Lifetime) -> TokenStream {
                 if punct.as_char() == '\'' && punct.spacing() == Spacing::Joint =>
             {
                 match iter.peek() {
-                    Some(TokenTree::Ident(ident)) if ident == "de" => {
+                    Some(TokenTree::Ident(ident)) if ident == &from.ident => {
                         iter.next();
                         out.extend(quote!(#to));
                     }
@@ -969,6 +1133,15 @@ fn scan_serde(attrs: &[syn::Attribute]) -> SerdeAttrs {
                     Ok(())
                 })?;
                 return Ok(());
+            } else if meta.path.is_ident("default") {
+                out.default = !meta.input.peek(syn::Token![=]);
+            } else if meta.path.is_ident("crate") {
+                out.explicit_crate = true;
+            } else if meta.path.is_ident("skip_serializing")
+                || meta.path.is_ident("skip_deserializing")
+                || meta.path.is_ident("skip_serializing_if")
+            {
+                out.positional_skip = Some(meta.path.span());
             } else if meta.path.is_ident("skip") {
                 out.skip = Some(meta.path.span());
             } else if meta.path.is_ident("tag")
@@ -1028,11 +1201,13 @@ mod tests {
         assert!(out.contains(r#"remote = "ProtectedHeader""#), "{out}");
         assert!(out.contains(r#"with = "serde_bytes""#), "{out}");
         assert!(
-            out.contains("impl :: serde :: Serialize for ProtectedHeader"),
+            out.contains("impl :: cbor2 :: __serde :: Serialize for ProtectedHeader"),
             "{out}"
         );
         assert!(
-            out.contains("impl < '__de > :: serde :: Deserialize < '__de > for ProtectedHeader"),
+            out.contains(
+                "impl < '__de > :: cbor2 :: __serde :: Deserialize < '__de > for ProtectedHeader"
+            ),
             "{out}"
         );
         // The #[cbor(...)] attributes stay off the shadow.
@@ -1064,7 +1239,7 @@ mod tests {
         assert!(!out.contains("@@CBOR@@"), "{out}");
         assert!(out.contains(r#"remote = "Plain""#), "{out}");
         assert!(
-            out.contains("impl :: serde :: Serialize for Plain"),
+            out.contains("impl :: cbor2 :: __serde :: Serialize for Plain"),
             "{out}"
         );
 
@@ -1124,8 +1299,8 @@ mod tests {
             }
         });
 
-        assert!(out.contains("__cbor2_flatten_serialize"), "{out}");
-        assert!(out.contains("__cbor2_flatten_deserialize"), "{out}");
+        assert!(out.contains("flatten_serialize"), "{out}");
+        assert!(out.contains("flatten_deserialize"), "{out}");
         assert!(
             out.contains(r#"rename = "@@CBOR@@61@@iss=1@@Claims""#),
             "{out}"
@@ -1187,12 +1362,14 @@ mod tests {
         assert!(out.contains(r#"remote = "Wrap""#), "{out}");
         assert!(
             out.contains(
-                "impl < T : Clone + :: serde :: Serialize > :: serde :: Serialize for Wrap < T >"
+                "impl < T : Clone + :: cbor2 :: __serde :: Serialize > :: cbor2 :: __serde :: Serialize for Wrap < T >"
             ),
             "{out}"
         );
         assert!(
-            out.contains("impl < '__de , T : Clone + :: serde :: Deserialize < '__de > >"),
+            out.contains(
+                "impl < '__de , T : Clone + :: cbor2 :: __serde :: Deserialize < '__de > >"
+            ),
             "{out}"
         );
         // The trait impl carries the original generics, without serde bounds.
@@ -1214,7 +1391,7 @@ mod tests {
 
         assert!(
             out.contains(
-                "impl < '__de_ : 'a + '__de , 'a , '__de > :: serde :: Deserialize < '__de_ > for Borrowed < 'a , '__de >"
+                "impl < '__de_ : 'a + '__de , 'a , '__de > :: cbor2 :: __serde :: Deserialize < '__de_ > for Borrowed < 'a , '__de >"
             ),
             "{out}"
         );
@@ -1506,8 +1683,14 @@ mod tests {
                 marker: PhantomData<T>,
             }
         });
-        assert!(!out.contains("T : :: serde :: Serialize"), "{out}");
-        assert!(!out.contains("T : :: serde :: Deserialize"), "{out}");
+        assert!(
+            !out.contains("T : :: cbor2 :: __serde :: Serialize"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("T : :: cbor2 :: __serde :: Deserialize"),
+            "{out}"
+        );
 
         // Split bounds replace each direction separately, and `'de` in a
         // deserialize bound is renamed to the impl's fresh lifetime.
@@ -1522,7 +1705,10 @@ mod tests {
             out.contains("T : :: serde :: Deserialize < '__de > + Default"),
             "{out}"
         );
-        assert!(out.contains("T : :: serde :: Serialize"), "{out}");
+        assert!(
+            out.contains("T : :: cbor2 :: __serde :: Serialize"),
+            "{out}"
+        );
     }
 
     #[test]

@@ -8,12 +8,12 @@ pub use crate::de::Error;
 pub use crate::diag::{to_cdn, to_cdn_pretty, to_cdn_pretty_with_key_comments};
 
 mod applications;
-#[cfg(feature = "cdn")]
+#[cfg(feature = "cdn-cri")]
 mod cri;
 mod datetime;
 mod encode;
 mod float;
-#[cfg(feature = "cdn")]
+#[cfg(feature = "cdn-hash")]
 mod hash;
 mod ip;
 mod number;
@@ -33,7 +33,8 @@ mod types;
 /// crate. The built-in extensions include `dt`/`DT`, `ip`/`IP`, `b1`/`t1`,
 /// `ilbs`/`ilts`, `bytes`, `same`, and `float`; enabling the `cdn` feature
 /// also enables the `hash`, `cri`, and `CRI` extensions that require external
-/// crates. The default encoding is preferred serialization.
+/// crates and `std`. Use `cdn-hash` alone for hash literals with `no_std` +
+/// `alloc`, or `cdn-cri` for CRI alone. The default encoding is preferred serialization.
 ///
 /// Encoding indicators that carry no defined meaning here — the reserved
 /// `_4` through `_7`, indicator words from future registrations, and the
@@ -66,6 +67,33 @@ pub fn cdn_to_vec(input: &str) -> Result<Vec<u8>, Error> {
 #[cfg(feature = "alloc")]
 pub fn cdn_sequence_to_vec(input: &str) -> Result<Vec<u8>, Error> {
     parser::sequence_to_vec(input)
+}
+
+/// Encodes one CDN item, rejecting source text larger than `max_len` bytes.
+///
+/// The check precedes allocation and CR normalization. Use a source-size
+/// budget for untrusted CDN: arbitrary-size decimal integer conversion still
+/// requires more than linear work, even though binary/octal/hex input is linear.
+pub fn cdn_to_vec_with_limit(input: &str, max_len: usize) -> Result<Vec<u8>, Error> {
+    check_input_limit(input, max_len)?;
+    cdn_to_vec(input)
+}
+
+/// Encodes a CDN sequence with the same source-byte budget as
+/// [`cdn_to_vec_with_limit`].
+pub fn cdn_sequence_to_vec_with_limit(input: &str, max_len: usize) -> Result<Vec<u8>, Error> {
+    check_input_limit(input, max_len)?;
+    cdn_sequence_to_vec(input)
+}
+
+fn check_input_limit(input: &str, max_len: usize) -> Result<(), Error> {
+    if input.len() > max_len {
+        return Err(Error::semantic(
+            max_len,
+            "CDN input exceeds source byte limit",
+        ));
+    }
+    Ok(())
 }
 
 /// Deserializes one CDN item into a serde value.

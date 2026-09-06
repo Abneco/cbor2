@@ -1,0 +1,22 @@
+[package]
+name = "cbor2-derive-fixtures"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+cbor2 = { path = "../..", features = ["derive"] }
+
+[[bin]]
+name = "pass"
+path = "pass.rs"
+
+[[bin]]
+name = "array_skip"
+path = "array_skip.rs"
+
+[[bin]]
+name = "tuple_skip"
+path = "tuple_skip.rs"

@@ -5,7 +5,6 @@ use crate::value::Value;
 
 use super::types::{Arg, Atom};
 
-#[cfg(feature = "cdn")]
 pub(super) fn hash_args(
     args: Vec<Arg>,
     offset: usize,
@@ -18,20 +17,19 @@ pub(super) fn hash_args(
     }
 
     let mut iter = args.into_iter();
-    let data = match iter.next().unwrap().value {
+    let data = match iter.next().unwrap().into_value()? {
         Value::Text(text) => text.into_bytes(),
         Value::Bytes(bytes) => bytes,
         _ => return Err(Error::semantic(offset, "hash input must be a string")),
     };
 
     let alg = match iter.next() {
-        Some(arg) => Some(hash_alg_from_value(arg.value, offset)?),
+        Some(arg) => Some(hash_alg_from_value(arg.into_value()?, offset)?),
         None => None,
     };
     Ok((data, alg))
 }
 
-#[cfg(feature = "cdn")]
 #[derive(Clone, Copy)]
 pub(super) enum HashAlg {
     Sha256,
@@ -43,7 +41,6 @@ pub(super) enum HashAlg {
     Shake256,
 }
 
-#[cfg(feature = "cdn")]
 fn hash_alg_from_value(value: Value, offset: usize) -> Result<HashAlg, Error> {
     match value {
         Value::Integer(n) => hash_alg_from_id(i128::from(n), offset),
@@ -55,7 +52,6 @@ fn hash_alg_from_value(value: Value, offset: usize) -> Result<HashAlg, Error> {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn hash_alg_from_id(id: i128, offset: usize) -> Result<HashAlg, Error> {
     match id {
         -15 => Ok(HashAlg::Sha256_64),
@@ -72,7 +68,6 @@ fn hash_alg_from_id(id: i128, offset: usize) -> Result<HashAlg, Error> {
     }
 }
 
-#[cfg(feature = "cdn")]
 fn hash_alg_from_name(name: &str, offset: usize) -> Result<HashAlg, Error> {
     match name {
         "SHA-256" => Ok(HashAlg::Sha256),
@@ -89,7 +84,6 @@ fn hash_alg_from_name(name: &str, offset: usize) -> Result<HashAlg, Error> {
     }
 }
 
-#[cfg(feature = "cdn")]
 pub(super) fn hash_atom(data: Vec<u8>, alg: Option<HashAlg>, offset: usize) -> Result<Atom, Error> {
     use sha2::{Digest, Sha256, Sha384, Sha512, Sha512_256};
     use shake::{

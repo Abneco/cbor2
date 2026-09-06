@@ -82,6 +82,55 @@ fn read_value_deserializes_owned_values() {
 }
 
 #[test]
+fn typed_array_boundaries_do_not_leak_across_items() {
+    type Record = ((u8,), u8);
+    let bytes = cbor2::cdn_to_vec("[[_ 1], 2]").unwrap();
+    let mut reader = Cursor::new(bytes);
+    assert_eq!(
+        block_on(async_io::read_value::<Record, _>(&mut reader)).unwrap(),
+        ((1,), 2)
+    );
+
+    let bad = cbor2::cdn_to_vec("[[1, 2], 3]").unwrap();
+    let mut sequence = bad.clone();
+    sequence.extend(cbor2::to_vec(&42u8).unwrap());
+    let mut reader = Cursor::new(sequence);
+    assert!(block_on(async_io::read_value::<Record, _>(&mut reader)).is_err());
+    assert_eq!(reader.pos, bad.len());
+    assert_eq!(
+        block_on(async_io::read_value::<u8, _>(&mut reader)).unwrap(),
+        42
+    );
+}
+
+#[test]
+fn oversized_declared_body_fails_before_waiting_for_body() {
+    // The budget is larger than the internal 4 KiB chunk, but the declared
+    // body is already known to exceed it. No body byte needs to arrive.
+    let mut reader = Cursor::new(vec![0x59, 0x40, 0x00]);
+    let error = block_on(async_io::read_item_with_limit(&mut reader, 8192)).unwrap_err();
+    assert!(error.to_string().contains("exceeds size limit"));
+    assert_eq!(reader.pos, 3);
+}
+
+#[test]
+fn empty_containers_at_depth_limit_match_synchronous_validation() {
+    let limit = cbor2::de::DEFAULT_RECURSION_LIMIT;
+    for last in [vec![0x80], vec![0xa0], vec![0x9f, 0xff], vec![0xbf, 0xff]] {
+        let mut bytes = vec![0x81; limit - 1];
+        bytes.extend(&last);
+        assert!(cbor2::validate_slice(&bytes).is_ok());
+        assert_eq!(
+            block_on(async_io::read_item(&mut Cursor::new(bytes.clone()))).unwrap(),
+            bytes
+        );
+        bytes.insert(0, 0x81);
+        assert!(cbor2::validate_slice(&bytes).is_err());
+        assert!(block_on(async_io::read_item(&mut Cursor::new(bytes))).is_err());
+    }
+}
+
+#[test]
 fn read_item_with_limit_enforces_total_item_size() {
     let mut bytes = vec![0x58, 0x20]; // h'..' with a one-byte length argument.
     bytes.extend(std::iter::repeat_n(0xab, 32));

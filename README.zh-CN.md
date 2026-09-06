@@ -150,16 +150,16 @@ assert_eq!(photo, back);
 
 ## Crate 特性
 
-| 特性      | 默认启用         | 作用                                                                                                                    |
-| --------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `std`     | 是               | 为每个 `std::io::Read`/`Write` 实现 `cbor2::io` 特征，添加 `async_io` 并添加 `HashMap` 转换。隐式启用 `alloc`。         |
-| `alloc`   | 是（通过 `std`） | 所有需要堆的操作：`Value`、`to_vec`/`from_slice`/`from_reader`、`RawValue`、`diagnostic`、确定性编码器以及 `cbor!` 宏。 |
-| `cdn` | 否 | 同时启用 `cdn-hash` 和 `cdn-cri`；需要 `std`。 |
-| `cdn-hash` | 否 | 哈希字面量；支持 `no_std + alloc`。 |
-| `cdn-cri` | 否 | CRI 字面量；IRI 解析器需要 `std`。 |
-| `derive`  | 否               | `#[derive(cbor2::Cbor)]` 宏。                                                                                           |
-| `futures` | 否               | 为 `futures_io::AsyncRead`/`AsyncWrite` 添加 `async_io::futures` 辅助函数。隐式启用 `std`。                             |
-| `tokio`   | 否               | 为 `tokio::io::AsyncRead`/`AsyncWrite` 添加 `async_io::tokio` 辅助函数。隐式启用 `std`。                                |
+| 特性       | 默认启用         | 作用                                                                                                                    |
+| ---------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `std`      | 是               | 为每个 `std::io::Read`/`Write` 实现 `cbor2::io` 特征，添加 `async_io` 并添加 `HashMap` 转换。隐式启用 `alloc`。         |
+| `alloc`    | 是（通过 `std`） | 所有需要堆的操作：`Value`、`to_vec`/`from_slice`/`from_reader`、`RawValue`、`diagnostic`、确定性编码器以及 `cbor!` 宏。 |
+| `cdn`      | 否               | 同时启用 `cdn-hash` 和 `cdn-cri`；需要 `std`。                                                                          |
+| `cdn-hash` | 否               | 哈希字面量；支持 `no_std + alloc`。                                                                                     |
+| `cdn-cri`  | 否               | CRI 字面量；IRI 解析器需要 `std`。                                                                                      |
+| `derive`   | 否               | `#[derive(cbor2::Cbor)]` 宏。                                                                                           |
+| `futures`  | 否               | 为 `futures_io::AsyncRead`/`AsyncWrite` 添加 `async_io::futures` 辅助函数。隐式启用 `std`。                             |
+| `tokio`    | 否               | 为 `tokio::io::AsyncRead`/`AsyncWrite` 添加 `async_io::tokio` 辅助函数。隐式启用 `std`。                                |
 
 在不启用任何特性的情况下，此 crate 是一个适用于受限目标的 `#![no_std]` 核心库：支持通过 `to_writer`/`to_slice`/`serialized_size` 进行流式序列化、格式完好性验证、`tag` 包装器以及 `core` 标头编解码器。通过 serde 反序列化需要 `alloc`。读取器和写入器实现了简易的 `cbor2::io` 特征，这些特征已为字节切片（以及在启用 `alloc` 时的 `Vec<u8>`）提供：
 

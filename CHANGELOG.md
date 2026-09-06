@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [1.1.5] - 2026-09-06
 
 ### Fixed
 
@@ -11,15 +11,18 @@
   preserve NaN sign, signaling bit and payload at the shortest exact width.
   Diagnostic output uses float literals for non-default NaNs.
 * Preserve RawValue bytes and Simple values in derived flattened structs;
-  preserve undefined during canonical encoding of RawValue, and reject CBOR-
-  equivalent signed-zero map keys. Failed Value canonicalization leaves the
-  original value unchanged.
+  reject tagged extension keys that serde cannot represent instead of silently
+  stripping their tags; preserve undefined during canonical encoding of
+  RawValue, and reject CBOR-equivalent signed-zero map keys. Failed Value
+  canonicalization leaves the original value unchanged, and canonical writers
+  complete semantic validation before emitting bytes.
 * Correct float/same extension argument forms, same map equality, fractional
   epoch conversion, elided UTF-8 concatenation, source CR/raw-string grammar,
   IP address validation and numeric registered-name CRI hosts.
 * Support container defaults and recursive Self references in the Cbor derive,
-  resolve serde without a direct consumer dependency, and reject positional
-  field configurations that would silently shift data.
+  avoid internal lifetime-prefix collisions, resolve serde without a direct
+  consumer dependency, and reject positional field configurations that would
+  silently shift data.
 * Correct the Homebrew formula smoke test for pretty diagnostic output.
 
 ### Features

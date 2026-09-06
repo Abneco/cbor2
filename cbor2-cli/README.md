@@ -41,7 +41,7 @@ Commands:
 | Inspect pasted CBOR   | Run `cbor <hex-or-base64>` to render RFC 8949 diagnostic notation.                                                                   |
 | Preserve wire details | Bare `cbor` captures each item as raw bytes, so indefinite lengths, segmented strings, `undefined` and simple values remain visible. |
 | Decode for JSON tools | `cbor decode --json` pretty-prints CBOR as JSON, one document per item.                                                              |
-| Encode fixtures       | `cbor encode` turns JSON-compatible values or Concise Diagnostic Notation into CBOR bytes.                                          |
+| Encode fixtures       | `cbor encode` turns JSON-compatible values or Concise Diagnostic Notation into CBOR bytes.                                           |
 | Copy bytes safely     | `cbor encode --hex` prints copyable lowercase hex; add `--json` or `--cdn` when the input syntax must be fixed.                      |
 | Work with sequences   | Multiple JSON or CDN values become a CBOR sequence; CBOR sequences decode item by item.                                              |
 | Validate inputs       | `cbor validate <hex-or-file>` checks one or more complete CBOR items and prints `valid` on success.                                  |

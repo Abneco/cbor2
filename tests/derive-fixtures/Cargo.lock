@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "cbor2"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "cbor2-derive",
  "serde",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "cbor2-derive"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "proc-macro2",
  "quote",

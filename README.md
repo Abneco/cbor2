@@ -18,15 +18,15 @@ from `std` services down to constrained `no_std` targets.
 
 ## Why cbor2
 
-| Need                     | Built in                                                                                                                 |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| Serde encode/decode      | `to_vec`, `to_writer`, borrowing `from_slice`, `from_reader` and direct support for derived serde types.                 |
-| Stable protocol bytes    | RFC 8949 preferred serialization plus deterministic/canonical encoders and selectable map key ordering.                  |
-| Protocol CBOR            | Simple values, semantic tags, bignums, integer map keys, field-order arrays and COSE-style tags with `#[derive(cbor2::Cbor)]`. |
-| Dynamic or unknown data  | `Value`, the `cbor!` macro and `RawValue` for validated pass-through bytes.                                              |
-| Safe input handling      | Exact-one-item well-formedness check, CBOR sequence iteration, recursion limits and guarded allocation sizes.            |
-| Async boundaries         | `async_io` reads or writes one complete CBOR item without pretending serde itself is async.                              |
-| Debugging and inspection | RFC 8949 diagnostic notation, pretty diagnostics and the companion `cbor` CLI.                                           |
+| Need                     | Built in                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Serde encode/decode      | `to_vec`, `to_writer`, borrowing `from_slice`, `from_reader` and direct support for derived serde types.                             |
+| Stable protocol bytes    | RFC 8949 preferred serialization plus deterministic/canonical encoders and selectable map key ordering.                              |
+| Protocol CBOR            | Simple values, semantic tags, bignums, integer map keys, field-order arrays and COSE-style tags with `#[derive(cbor2::Cbor)]`.       |
+| Dynamic or unknown data  | `Value`, the `cbor!` macro and `RawValue` for validated pass-through bytes.                                                          |
+| Safe input handling      | Exact-one-item well-formedness check, CBOR sequence iteration, recursion limits and guarded allocation sizes.                        |
+| Async boundaries         | `async_io` reads or writes one complete CBOR item without pretending serde itself is async.                                          |
+| Debugging and inspection | RFC 8949 diagnostic notation, pretty diagnostics and the companion `cbor` CLI.                                                       |
 | Embedded targets         | `no_std + alloc` for the full heap-backed API, or no allocation for serialization, well-formedness checks and the core header codec. |
 
 Licensed under the MIT License.
@@ -243,16 +243,16 @@ CBOR sequences and canonical encoding.
 
 ## Crate features
 
-| Feature   | Default         | Effect                                                                                                                                               |
-| --------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `std`     | yes             | Implements the `cbor2::io` traits for every `std::io::Read`/`Write`, adds `async_io`, and adds the `HashMap` conversions. Implies `alloc`.           |
-| `alloc`   | yes (via `std`) | Everything needing a heap: `Value`, `to_vec`/`from_slice`/`from_reader`, `RawValue`, `diagnostic`, the deterministic encoders and the `cbor!` macro. |
-| `cdn`     | no              | Enables `cdn-hash` and `cdn-cri`: `hash`, `cri` and `CRI`. Requires `std`.                                                |
-| `cdn-hash` | no | Hash extension literals; works with `no_std + alloc`. |
-| `cdn-cri` | no | CRI extension literals; requires `std` through the IRI parser. |
-| `derive`  | no              | The `#[derive(cbor2::Cbor)]` macro.                                                                                                                  |
-| `futures` | no              | Adds `async_io::futures` helpers for `futures_io::AsyncRead`/`AsyncWrite`. Implies `std`.                                                            |
-| `tokio`   | no              | Adds `async_io::tokio` helpers for `tokio::io::AsyncRead`/`AsyncWrite`. Implies `std`.                                                               |
+| Feature    | Default         | Effect                                                                                                                                               |
+| ---------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `std`      | yes             | Implements the `cbor2::io` traits for every `std::io::Read`/`Write`, adds `async_io`, and adds the `HashMap` conversions. Implies `alloc`.           |
+| `alloc`    | yes (via `std`) | Everything needing a heap: `Value`, `to_vec`/`from_slice`/`from_reader`, `RawValue`, `diagnostic`, the deterministic encoders and the `cbor!` macro. |
+| `cdn`      | no              | Enables `cdn-hash` and `cdn-cri`: `hash`, `cri` and `CRI`. Requires `std`.                                                                           |
+| `cdn-hash` | no              | Hash extension literals; works with `no_std + alloc`.                                                                                                |
+| `cdn-cri`  | no              | CRI extension literals; requires `std` through the IRI parser.                                                                                       |
+| `derive`   | no              | The `#[derive(cbor2::Cbor)]` macro.                                                                                                                  |
+| `futures`  | no              | Adds `async_io::futures` helpers for `futures_io::AsyncRead`/`AsyncWrite`. Implies `std`.                                                            |
+| `tokio`    | no              | Adds `async_io::tokio` helpers for `tokio::io::AsyncRead`/`AsyncWrite`. Implies `std`.                                                               |
 
 With no features at all the crate is a `#![no_std]` core for constrained
 targets: streaming serialization with `to_writer`/`to_slice`/

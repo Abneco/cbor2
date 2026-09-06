@@ -22,15 +22,15 @@ integer map keys, field-order arrays, semantic tags and COSE-style compact
 structures.
 `#[derive(cbor2::Cbor)]` generates serde impls for that shape.
 
-| Need               | Built in                                                                                                    |
-| ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Integer map keys   | `#[cbor(key = 1)]` writes a real CBOR integer key, not the text key `"1"`.                                  |
-| Field-order arrays | `#[cbor(array)]` encodes a named struct as a compact CBOR array while keeping Rust field names.             |
-| Semantic tags      | `#[cbor(tag = 18)]` wraps the encoded item in a CBOR tag and accepts tagged or untagged input on decode.    |
-| COSE ergonomics    | Compact RFC 9052 structures can be declared directly on Rust structs and tuple structs.                     |
-| JSON compatibility | Field names and the type name stay untouched, so `serde_json` still uses the natural names and no CBOR tag. |
-| Runtime metadata   | The generated `cbor2::Cbor` impl exposes `T::KEYS`, `T::TAG`, `T::ARRAY` and `value.keys()`.                |
-| Serde attributes   | Field-level attributes such as `default`, `skip`, `alias` and `with = "serde_bytes"` continue to work.      |
+| Need               | Built in                                                                                                        |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Integer map keys   | `#[cbor(key = 1)]` writes a real CBOR integer key, not the text key `"1"`.                                      |
+| Field-order arrays | `#[cbor(array)]` encodes a named struct as a compact CBOR array while keeping Rust field names.                 |
+| Semantic tags      | `#[cbor(tag = 18)]` wraps the encoded item in a CBOR tag and accepts tagged or untagged input on decode.        |
+| COSE ergonomics    | Compact RFC 9052 structures can be declared directly on Rust structs and tuple structs.                         |
+| JSON compatibility | Field names and the type name stay untouched, so `serde_json` still uses the natural names and no CBOR tag.     |
+| Runtime metadata   | The generated `cbor2::Cbor` impl exposes `T::KEYS`, `T::TAG`, `T::ARRAY` and `value.keys()`.                    |
+| Serde attributes   | Field-level attributes such as `default`, `skip`, `alias` and `with = "serde_bytes"` continue to work.          |
 | Flattened maps     | `#[serde(flatten)]` on map-shaped structs can carry extension fields, including COSE-style integer/text labels. |
 
 ## Example

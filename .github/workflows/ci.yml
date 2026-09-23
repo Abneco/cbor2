@@ -97,6 +97,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -Dwarnings
 
+  benchmark-smoke:
+    name: benchmark fixtures and reporting (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --manifest-path cbor2-bench/Cargo.toml --all --check
+      - run: cargo test --manifest-path cbor2-bench/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path cbor2-bench/Cargo.toml --all-targets -- -Dwarnings
+      - run: python3 -B -m unittest discover -s cbor2-bench -p 'test_*.py'
+
   docs:
     name: docs
     runs-on: ubuntu-latest

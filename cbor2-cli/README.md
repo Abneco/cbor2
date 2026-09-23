@@ -54,7 +54,13 @@ or CDN values become a CBOR sequence (RFC 8742), and a CBOR sequence
 becomes one output document or line per item. Decoding, validation and
 `encode --json` stream item by item; CDN encoding (the default `encode`
 mode) reads its whole input before parsing, as CDN has no incremental
-parser. Data errors exit with status 1, usage errors with status 2.
+parser. Files and stdin contain raw CBOR bytes for CBOR-reading commands;
+hex/base64 detection applies only to inline arguments. Use `--` before an
+input starting with `-`, e.g. `cbor -- -Ds=`. Base64 accepts correct padding
+or no padding, and requires zero unused tail bits. For standard base64
+containing `/`, use base64url or decode it externally before piping raw bytes.
+Data errors exit with status 1, usage errors with status 2. A downstream
+consumer closing the output pipe (such as `head`) ends the command quietly.
 
 ## Agent-friendly usage
 
@@ -161,7 +167,10 @@ JSON conversion is best-effort where CBOR is richer: byte strings become
 lowercase hex strings, non-string map keys are JSON-encoded into strings,
 non-finite floats and `undefined` become `null`, integers beyond the
 64-bit ranges become strings, and tags are dropped (keeping the inner
-value).
+value). If multiple CBOR keys become the same JSON object key (including
+duplicate text keys), conversion fails with status 1 instead of overwriting
+a value. The failing item is not written; preceding sequence items may already
+have been output. Complete JSON items are flushed before reading the next item.
 
 ## encode
 
@@ -172,7 +181,10 @@ for copyable lowercase hex text:
 
 ```bash
 $ echo '{"name": "example", "ok": true}' | cbor encode | cbor
-{"name": "example", "ok": true}
+{
+  "name": "example",
+  "ok": true
+}
 
 $ echo '{"name": "example", "ok": true}' | cbor encode | xxd -p
 a2646e616d65676578616d706c65626f6bf5

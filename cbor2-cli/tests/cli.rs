@@ -14,13 +14,15 @@ fn run(args: &[&str], input: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("binary spawns");
-    child
-        .stdin
-        .take()
-        .expect("stdin is piped")
-        .write_all(input)
-        .expect("input is consumed");
-    child.wait_with_output().expect("binary exits")
+    // Drain output while feeding stdin: large streaming fixtures can fill both
+    // pipes and deadlock if the parent writes everything before reading.
+    std::thread::scope(|scope| {
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let writer = scope.spawn(move || stdin.write_all(input).expect("input is consumed"));
+        let output = child.wait_with_output().expect("binary exits");
+        writer.join().unwrap();
+        output
+    })
 }
 
 // Asserts a clean run and returns stdout.
@@ -94,6 +96,122 @@ fn decode_json_pretty_prints_json() {
     // The flexible input forms apply to decode as well.
     let out = ok(&["decode", "--json", "a1616101"], b"");
     assert_eq!(out, b"{\n  \"a\": 1\n}\n");
+}
+
+#[test]
+fn decode_json_rejects_colliding_keys_before_writing_the_item() {
+    for text in [
+        r#"{1: "a", "1": "b"}"#,
+        r#"{null: 1, "null": 2}"#,
+        r#"{"same": 1, "same": 2}"#,
+        r#"[{"nested": {1: 2, "1": 3}}]"#,
+        r#"{{1: 2, "1": 3}: 4}"#,
+    ] {
+        let bytes = cbor2::cdn_to_vec(text).unwrap();
+        let out = run(&["decode", "--json"], &bytes);
+        assert_eq!(out.status.code(), Some(1), "{text}");
+        assert!(out.stdout.is_empty(), "{text}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate JSON object key"));
+    }
+    assert_eq!(
+        ok(&["decode", "--json", "a20102617803"], b""),
+        b"{\n  \"1\": 2,\n  \"x\": 3\n}\n"
+    );
+    let out = run(&["decode", "--json", "01a201616161316162"], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"1\n");
+}
+
+#[test]
+fn base64_checks_padding_and_option_terminator() {
+    for args in [&["--", "-Ds="][..], &["decode", "--", "-Ds"][..]] {
+        assert_eq!(ok(args, b""), b"simple(59)\n");
+    }
+    assert_eq!(ok(&["validate", "--", "-Ds="], b""), b"valid\n");
+    for input in ["AQ", "AQ==", " A Q = = ", "AQI", "AQI="] {
+        assert!(run(&[input], b"").status.success(), "{input}");
+    }
+    for input in [
+        "AQ=", "AQ===", "AQ=====", "AQI==", "AQID=", "A=Q=", "AR==", "AR", "AQJ=", "AQJ",
+    ] {
+        assert_eq!(run(&[input], b"").status.code(), Some(2), "{input}");
+    }
+    // After `--`, even a help option is a literal file/input argument.
+    assert_eq!(run(&["--", "--help"], b"").status.code(), Some(2));
+}
+
+#[test]
+fn hex_output_handles_large_items_and_sequences() {
+    let json = format!("\"{}\"\n1", "large payload ".repeat(4096));
+    for mode in ["--json", "--cdn"] {
+        let bytes = ok(&["encode", mode], json.as_bytes());
+        let text = ok(&["encode", mode, "--hex"], json.as_bytes());
+        assert_eq!(text.last(), Some(&b'\n'));
+        assert_eq!(text.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(
+            hex(std::str::from_utf8(&text[..text.len() - 1]).unwrap()),
+            bytes
+        );
+    }
+    assert!(ok(&["encode", "--json", "--hex"], b"").is_empty());
+    assert_eq!(ok(&["encode", "--cdn", "--hex"], b""), b"\n");
+}
+
+#[test]
+fn json_decode_flushes_each_item_before_input_eof() {
+    use std::io::{BufRead, BufReader};
+    let mut child = Command::new(CBOR)
+        .args(["decode", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line).unwrap();
+        send.send(line).unwrap();
+    });
+    stdin.write_all(&[1]).unwrap();
+    let line = recv.recv_timeout(std::time::Duration::from_secs(5));
+    // Always close stdin and reap the child, including on a flush regression.
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert_eq!(line.unwrap(), "1\n");
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn closing_the_output_pipe_is_not_a_data_error() {
+    let json = format!("\"{}\"", "x".repeat(100_000));
+    let bytes = cbor2::to_vec(&"x".repeat(100_000)).unwrap();
+    for (args, input) in [
+        (&["decode"][..], bytes.as_slice()),
+        (&["decode", "--json"][..], bytes.as_slice()),
+        (&["encode", "--json"][..], json.as_bytes()),
+        (&["encode", "--json", "--hex"][..], json.as_bytes()),
+    ] {
+        let mut child = Command::new(CBOR)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take());
+        let result = child.stdin.take().unwrap().write_all(input);
+        if let Err(error) = result {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{args:?}: {:?}", out.stderr);
+        assert!(out.stderr.is_empty());
+    }
 }
 
 #[test]

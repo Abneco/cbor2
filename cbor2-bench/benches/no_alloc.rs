@@ -1,4 +1,4 @@
-//! Scenario: **`no_std` + `no_alloc`** — no heap at all.
+//! Scenario: fixed-buffer encoding and structural scans without hot-path allocation.
 //!
 //! ## Encoding (all five crates)
 //!
@@ -16,19 +16,17 @@
 //! The output buffer is allocated once during setup and reused; nothing on
 //! the measured path touches the allocator.
 //!
-//! ## Reading (cbor2 and minicbor only)
+//! ## Reading (cbor2 and minicbor measured here)
 //!
-//! Deserialization is where the designs diverge sharply. The four serde
-//! deserializers — cbor2, ciborium, serde_cbor and cbor4ii — all need a heap
-//! scratch buffer and therefore **cannot deserialize without `alloc` at
-//! all**. What cbor2 *does* offer without a heap is `cbor2::validate` (any
-//! reader) and the copy-free `cbor2::validate_slice`, which walk the bytes
-//! and prove well-formedness without materializing a value; minicbor's
-//! comparable no-alloc primitive is `Decoder::skip`. These are compared in
-//! the `scan` groups below. minicbor additionally is the only
-//! crate that can produce a *typed* value with no heap (by borrowing
-//! `&str`/`&[u8]` straight out of the input) — see the README capability
-//! matrix.
+//! These scan groups compare cbor2's validators with minicbor's `skip`.
+//! Both check text UTF-8; validation additionally enforces CBOR structure and
+//! complete input consumption. Serde_cbor also supports no-alloc typed reads
+//! and `IgnoredAny` via caller-provided scratch or mutable input, but is not
+//! measured in these scan groups. See the README capability matrix.
+//!
+//! This is a host build with alloc enabled. In particular, minicbor's `skip`
+//! uses its alloc-capable implementation (which has a different no-alloc
+//! implementation); these definite-length fixtures do not require its stack.
 
 use std::hint::black_box;
 
@@ -38,24 +36,31 @@ use serde::Serialize;
 use serde_bytes::ByteBuf;
 
 /// Reused scratch buffer, sized once to fit the largest fixture.
-const CAP: usize = 64 * 1024;
+const CAP: usize = FIXED_CAPACITY;
 
 fn bench_encode(c: &mut Criterion) {
     macro_rules! encode_group {
-        ($name:literal, $serde:expr, $mini:expr) => {{
+        ($name:literal, $identical:literal, $serde:expr, $mini:expr) => {{
             let data = $serde;
             let mini = $mini;
+            let encoded = Encoded::new(&data, &mini);
+            if $identical {
+                encoded.assert_identical();
+            }
             let mut g = c.benchmark_group($name);
             g.bench_function("cbor2", |b| {
                 let mut buf = vec![0u8; CAP];
-                b.iter(|| cbor2::to_slice(black_box(&data), &mut buf).unwrap().len())
+                b.iter(|| {
+                    black_box(cbor2::to_slice(black_box(&data), &mut buf).unwrap());
+                })
             });
             g.bench_function("ciborium", |b| {
                 let mut buf = vec![0u8; CAP];
                 b.iter(|| {
                     let mut slice: &mut [u8] = &mut buf[..];
                     ciborium::into_writer(black_box(&data), &mut slice).unwrap();
-                    CAP - slice.len()
+                    let len = CAP - slice.len();
+                    black_box(&buf[..len]);
                 })
             });
             g.bench_function("serde_cbor", |b| {
@@ -64,7 +69,8 @@ fn bench_encode(c: &mut Criterion) {
                     let mut ser =
                         serde_cbor::Serializer::new(serde_cbor::ser::SliceWrite::new(&mut buf));
                     black_box(&data).serialize(&mut ser).unwrap();
-                    ser.into_inner().bytes_written()
+                    let len = ser.into_inner().bytes_written();
+                    black_box(&buf[..len]);
                 })
             });
             g.bench_function("cbor4ii", |b| {
@@ -75,7 +81,8 @@ fn bench_encode(c: &mut Criterion) {
                     // into the fixed buffer without allocating.
                     let mut slice: &mut [u8] = &mut buf[..];
                     cbor4ii::serde::to_writer(&mut slice, black_box(&data)).unwrap();
-                    CAP - slice.len()
+                    let len = CAP - slice.len();
+                    black_box(&buf[..len]);
                 })
             });
             g.bench_function("minicbor", |b| {
@@ -83,7 +90,8 @@ fn bench_encode(c: &mut Criterion) {
                 b.iter(|| {
                     let mut cur = minicbor::encode::write::Cursor::new(&mut buf[..]);
                     minicbor::encode(black_box(&mini), &mut cur).unwrap();
-                    cur.position()
+                    let len = cur.position();
+                    black_box(&buf[..len]);
                 })
             });
             g.finish();
@@ -96,24 +104,30 @@ fn bench_encode(c: &mut Criterion) {
 
     encode_group!(
         "no_alloc/encode/int_array",
+        true,
         int_array(INT_ARRAY_LEN),
         int_array(INT_ARRAY_LEN)
     );
-    encode_group!("no_alloc/encode/log_batch", logs, logs_mini);
+    encode_group!("no_alloc/encode/log_batch", false, logs, logs_mini);
     encode_group!(
         "no_alloc/encode/blob",
+        true,
         ByteBuf::from(raw.clone()),
         minicbor::bytes::ByteVec::from(raw)
     );
 }
 
 /// No-alloc structural reads: prove well-formedness / skip one item without
-/// building a value. Only cbor2 and minicbor expose such a primitive.
+/// building a value. These groups cover the cbor2 and minicbor primitives.
 fn bench_scan(c: &mut Criterion) {
     macro_rules! scan_group {
-        ($name:literal, $serde:expr, $mini:expr) => {{
-            let bytes = cbor2::to_vec(&$serde).unwrap();
-            let bytes_mini = minicbor::to_vec(&$mini).unwrap();
+        ($name:literal, $identical:literal, $serde:expr, $mini:expr) => {{
+            let encoded = Encoded::new(&$serde, &$mini);
+            if $identical {
+                encoded.assert_identical();
+            }
+            let bytes = encoded.cbor2;
+            let bytes_mini = encoded.minicbor;
             let mut g = c.benchmark_group($name);
             g.bench_function("cbor2 (validate)", |x| {
                 x.iter(|| cbor2::validate(black_box(&bytes[..])).unwrap())
@@ -137,20 +151,22 @@ fn bench_scan(c: &mut Criterion) {
 
     scan_group!(
         "no_alloc/scan/int_array",
+        true,
         int_array(INT_ARRAY_LEN),
         int_array(INT_ARRAY_LEN)
     );
-    scan_group!("no_alloc/scan/log_batch", logs, logs_mini);
+    scan_group!("no_alloc/scan/log_batch", false, logs, logs_mini);
     scan_group!(
         "no_alloc/scan/blob",
+        true,
         ByteBuf::from(raw.clone()),
         minicbor::bytes::ByteVec::from(raw)
     );
 }
 
 /// `cbor2::serialized_size` computes the exact encoded length with no output
-/// buffer and no allocation — a sizing primitive the other crates do not
-/// ship. Shown across the three payloads.
+/// buffer and no allocation. Minicbor offers separate `CborLen` / `len` APIs;
+/// this group measures cbor2 only, across the three payloads.
 fn bench_serialized_size(c: &mut Criterion) {
     let logs = log_batch(LOG_BATCH_LEN);
     let ints = int_array(INT_ARRAY_LEN);

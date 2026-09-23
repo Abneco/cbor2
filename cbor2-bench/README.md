@@ -14,7 +14,9 @@ CBOR implementations:
 
 This crate is **detached from the parent `cbor2` workspace** (it declares its
 own `[workspace]`), so criterion and the four comparison crates never enter
-the library's dependency graph, CI matrix, or MSRV.
+the library's dependency graph or MSRV. A separate stable-toolchain CI job
+runs fixture assertions, benchmark smoke tests and parser tests; it does not
+collect performance timings.
 
 ## Running
 
@@ -25,6 +27,7 @@ cargo bench                 # everything
 cargo bench --bench alloc   # one scenario
 cargo bench --bench std -- 'encode/log_batch'   # one criterion filter
 cargo bench --bench focused -- review          # Value, diagnostics, hex and capacity workloads
+cargo bench --bench derive                     # equal-wire derive/flatten workloads
 
 cargo run --release --bin sizes   # encoded-size table only
 ```
@@ -33,21 +36,48 @@ Results land in `target/criterion/` (HTML reports under
 `target/criterion/report/index.html`). To regenerate the markdown tables in
 this file, capture a run and feed it to the bundled parser:
 
+For a published comparison, run from a clean checkout and retain the commit,
+compiler, command, complete dependency lockfile and raw output together:
+
 ```sh
-cargo bench -- --noplot --warm-up-time 0.5 --measurement-time 2 --sample-size 60 \
-  | tee bench_results.log
-python3 parse_results.py bench_results.log
+# Generate the local lockfile first if this is a new checkout.
+test -f Cargo.lock || cargo generate-lockfile
+run_dir="target/benchmark-runs/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$run_dir"
+git rev-parse HEAD > "$run_dir/commit.txt"
+git status --short > "$run_dir/status.txt"
+rustc -Vv > "$run_dir/rustc.txt"
+uname -a > "$run_dir/platform.txt"
+cp Cargo.lock "$run_dir/Cargo.lock"
+cat > "$run_dir/command.sh" <<'SH'
+cargo bench --locked -- --noplot --warm-up-time 0.5 --measurement-time 2 --sample-size 60
+SH
+sh "$run_dir/command.sh" > "$run_dir/stdout.log" 2> "$run_dir/stderr.log"
+python3 parse_results.py "$run_dir/stdout.log" > "$run_dir/tables.md"
+```
+
+The parser reports Criterion's time **point estimate** (slope, or mean when
+slope is unavailable), not the sample median. It includes all five targets,
+including `derive`, and ignores unsupported groups without reusing another
+benchmark's identity. Missing measurements appear as `—`.
+
+For a quick correctness check without collecting timings:
+
+```sh
+cargo test --all-targets
+python3 -B -m unittest discover -s . -p 'test_*.py'
 ```
 
 ## What is measured
 
-### Three scenarios → three benchmark binaries
+### Three comparison scenarios and two regression targets
 
-The three deployment modes the `cbor2` library supports are each exercised
-through the *API path* that mode actually uses. (The comparison runs on a
-`std` host — the point is to measure the encode/decode paths that the `std`,
-`no_std + alloc`, and `no_std + no_alloc` configurations select, not to
-re-measure the same call three times.)
+The comparison targets select in-memory, reader/writer, and fixed-buffer
+API paths on a `std` host. They do not certify `no_std` builds: dependencies
+still have their host features enabled. In particular, minicbor has distinct
+`skip` implementations with and without `alloc`; this suite measures the
+alloc-capable version on definite-length fixtures that need no heap-backed stack.
+The `focused` and `derive` targets track cbor2 regressions across revisions.
 
 | binary                            | scenario            | encode path                                     | decode path                             |
 | --------------------------------- | ------------------- | ----------------------------------------------- | --------------------------------------- |
@@ -65,47 +95,44 @@ so every crate and every run sees byte-identical input:
 - **`log_batch`** — 128 structured telemetry records mixing text, integers,
   a float, a bool and a nested string list. The "real document" case. The
   serde crates encode it as text-keyed maps; minicbor uses its idiomatic
-  integer-keyed array, so its bytes are smaller (see sizes table).
+  positional array, so its bytes are smaller (see sizes table).
 - **`blob`** — one 4 KiB CBOR byte string (major type 2), via
   `serde_bytes::ByteBuf` / `minicbor::bytes::ByteVec`. The COSE / crypto
   payload case.
 
 ## Capability matrix
 
-Performance aside, the scenarios differ in *what is even possible*. This is
-the single most important takeaway:
+Capabilities below refer to the listed versions' high-level APIs. Building
+without `alloc` support is different from a particular operation performing
+zero allocations in a host build.
 
-| operation                             | cbor2 | ciborium | serde_cbor | cbor4ii | minicbor |
-| ------------------------------------- | :---: | :------: | :--------: | :-----: | :------: |
-| encode → `Vec` (alloc)                |   ✅   |    ✅     |     ✅      |    ✅    |    ✅     |
-| encode → fixed `&mut [u8]` (no_alloc) |   ✅   |    ✅     |     ✅      |   ✅⁷    |    ✅     |
-| decode from slice (alloc)             |   ✅   |    ✅¹    |     ✅      |    ✅    |    ✅     |
-| decode via `io::Read` (std)           |   ✅   |    ✅     |     ✅      |    ✅    |    ❌²    |
-| **decode without alloc**              |  ❌³   |    ❌     |     ❌      |   ❌³    |    ✅     |
-| no-alloc structural scan / validate   |  ✅⁴   |    ❌     |     ❌      |    ❌    |    ✅⁵    |
-| exact size without encoding           |  ✅⁶   |    ❌     |     ❌      |    ❌    |    ❌     |
+| operation | cbor2 | ciborium | serde_cbor | cbor4ii | minicbor |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| encode → `Vec` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| encode → fixed `&mut [u8]` | ✅ | ✅ | ✅ | ✅⁷ | ✅ |
+| decode from slice | ✅ | ✅¹ | ✅ | ✅ | ✅ |
+| decode via `io::Read` | ✅ | ✅ | ✅ | ✅ | ❌² |
+| typed decode with no `alloc` support | ❌³ | ❌ | ✅⁸ | ❌³ | ✅ |
+| structural scan with no `alloc` support | ✅⁴ | — | ✅⁸ | — | ✅⁵ |
+| exact size without writing encoded bytes | ✅⁶ | — | — | — | ✅⁹ |
 
-1. ciborium has no borrowing slice decoder; `from_reader(&bytes[..])` is its
-   only form, so its "slice" decode copies.
-2. minicbor has no `io::Read` decoder at all — it is slice-only by design.
-3. The ❌ is about the **serde** path only: cbor2's `Deserializer` (like every
-   serde-based CBOR crate's) needs a heap scratch buffer. cbor2's low-level
-   [`core::Decoder`] pull API *does* decode without `alloc` — it is exactly
-   what the no-alloc `validate` is built on; see the example under the matrix.
-4. [`cbor2::validate`](https://docs.rs/cbor2/latest/cbor2/fn.validate.html).
-5. minicbor `Decoder::skip` (and full no-alloc typed decode into borrowed
-   `&str`/`&[u8]`).
-6. [`cbor2::serialized_size`](https://docs.rs/cbor2/latest/cbor2/fn.serialized_size.html).
-7. cbor4ii has no public `no_std` slice serializer; it fills a fixed
-   `&mut [u8]` through `to_writer`, which needs `std`.
+1. Ciborium has no borrowing slice decoder; its reader API copies input.
+2. Minicbor's decoder accepts slices rather than `io::Read`.
+3. These entries describe the serde front ends, which require `alloc` support.
+   cbor2's low-level [`core::Decoder`] does support manual decoding without it.
+4. cbor2 provides `validate` and `validate_slice`: both check structure, UTF-8,
+   nesting limits and complete consumption of exactly one item.
+5. Minicbor `Decoder::skip` also checks text UTF-8, but skips one value rather
+   than validating exact-buffer consumption. Its no-alloc implementation has
+   restrictions on nested indefinite-length containers.
+6. cbor2's `serialized_size` uses the existing serde `Serialize` implementation.
+7. The cbor4ii path here uses `to_writer` over a slice and requires `std`.
+8. Serde_cbor offers `de::from_slice_with_scratch` and `de::from_mut_slice`
+   without `alloc`, including typed borrowed values and `IgnoredAny` scans.
+   Targets must themselves avoid allocation; the caller supplies any scratch.
+9. Minicbor offers `len` / `len_with` using its separate `CborLen` trait.
 
-The headline: among **serde** front-ends, only minicbor can deserialize into a
-typed value with no heap — every serde-based CBOR crate, cbor2 included, needs
-`alloc` for a serde `Deserialize`. But cbor2 is not blind without a heap: its
-low-level [`core::Decoder`] reads CBOR with zero allocation (and is what powers
-the no-alloc `validate`). So in `no_std + no_alloc` cbor2 gives you zero-alloc
-*encoding*, *validation*, exact *sizing*, and manual *decoding* via
-`core::Decoder` — just not serde-typed decoding.
+For example, cbor2's low-level decoder can read an integer array without a heap:
 
 ```rust
 use cbor2::core::{Decoder, Header};
@@ -131,16 +158,21 @@ assert_eq!(sum, 43);
 ## Results
 
 <!-- RESULTS:START -->
-Median wall-clock time per operation (criterion, lower is better). Absolute
+Historical Criterion time point estimates (lower is better). Absolute
 numbers are machine-dependent — reproduce with `cargo bench`; regenerate the
 tables with `python3 parse_results.py bench_results.log`. Recorded on an
 **Apple M1 Pro (macOS 26.5, rustc 1.95.0, criterion 0.5.1)**.
+
+These timings predate the result-parser fixes and the changes that make
+fixed/reused-buffer benchmarks consume their output bytes. They have not been
+regenerated and should not be used as current rankings. The size table has
+been rechecked; missing newer timing columns are left blank rather than inferred.
 
 #### Encoded size (bytes)
 
 `int_array` and `blob` are **byte-identical across all five crates**, so those
 rows are exact apples-to-apples comparisons. `log_batch` differs by design:
-minicbor encodes an integer-keyed array (37% smaller, part of why it is faster
+minicbor encodes a positional array (37% smaller, part of why it is faster
 on it), and cbor4ii is slightly larger because it keeps floats at 64-bit where
 the other serde crates narrow them to `f32`.
 
@@ -172,9 +204,8 @@ the other serde crates narrow them to `f32`.
 | `decode/log_batch` | 54.1 µs | 66.9 µs  | 57.1 µs    | 60.7 µs | 22.4 µs  |
 | `decode/blob`      | 147 ns  | 227 ns   | 231 ns     | 101 ns  | 97.8 ns  |
 
-minicbor's `decode` is slice-only, so its `std/decode` numbers are the same
-zero-copy path as `alloc/decode`; the serde crates here pay the copying
-`io::Read` source.
+Minicbor uses its slice decoder in both scenarios. These owned-output
+fixtures still allocate their decoded vectors, strings and byte buffers.
 
 #### `no_alloc` — fixed-buffer encode (zero allocation)
 
@@ -188,18 +219,19 @@ cbor4ii has no public `no_std` slice serializer; here it fills the buffer via
 `to_writer` over a `&mut [u8]` (std::io), whose many small writes make it much
 slower than its own `to_vec` — the no-alloc encode is not where it shines.
 
-#### `no_alloc` — structural scan (the only no-alloc reads available)
+#### `no_alloc` — structural scan
 
-The serde deserializers (ciborium, serde_cbor, cbor4ii) cannot read without
-`alloc` at all. cbor2 offers `validate`; minicbor offers `Decoder::skip`. Note
-these are not equivalent operations: cbor2's `validate` also verifies every
-text segment is valid UTF-8, which `skip` does not.
+Both cbor2's validators and minicbor's `skip` check text UTF-8. Their contracts
+still differ: cbor2 checks exactly one complete item, whereas `skip` advances
+over one value. Serde_cbor also supports no-alloc reads (see the matrix), but
+is not included in these scan measurements. `validate_slice` has no historical
+measurement in this table; new parser output includes it.
 
-| payload     | cbor2 `validate` | minicbor `skip` |
-| ----------- | ---------------- | --------------- |
-| `int_array` | 5.50 µs          | 4.59 µs         |
-| `log_batch` | 97.2 µs          | 13.9 µs         |
-| `blob`      | 110 ns           | 11.3 ns         |
+| payload | cbor2 `validate` | cbor2 `validate_slice` | minicbor `skip` |
+| --- | --- | --- | --- |
+| `int_array` | 5.50 µs | — | 4.59 µs |
+| `log_batch` | 97.2 µs | — | 13.9 µs |
+| `blob` | 110 ns | — | 11.3 ns |
 
 #### `no_alloc` — `cbor2::serialized_size` (cbor2 only)
 
@@ -213,39 +245,11 @@ Exact encoded length with no output buffer; O(1) for a byte string.
 
 ### Reading the numbers
 
-- **Byte-identical workloads** (`int_array`, `blob`): on the integer array
-  `serde_cbor` is fastest (~1.2–1.7 µs); cbor4ii, cbor2 and minicbor cluster
-  around 1.5–3.3 µs and ciborium trails (~6–7 µs). On the single 4 KiB byte
-  string everything is within noise; **cbor2 edges it** (102 ns in `alloc`,
-  60 ns in `no_alloc`) — it is one length header plus a `memcpy`.
-- **Structured `log_batch`** (text-keyed maps; cbor4ii's is ~3% larger, see
-  sizes): the strongest serde encoders are **cbor4ii and cbor2** — cbor4ii is
-  the fastest of *all* crates in `std` (3.5 µs, past minicbor) and leads the
-  serde field in `alloc` (6.1 µs), while in `no_alloc` **cbor2 leads the serde
-  field** (4.9 µs, where cbor4ii's `io::Write`-over-slice encoder collapses to
-  13.7 µs). On decode **minicbor leads** (~22 µs, helped by its 37%-smaller
-  payload); the serde decoders run from serde_cbor (34 µs) up.
-- **No-alloc encode**: cbor2 leads the serde field into a fixed buffer (1.7 /
-  4.9 µs) — even beating minicbor on the byte-identical integer array (1.7 vs
-  2.6 µs), though minicbor's compact array form wins the map (4.0 µs). serde_cbor
-  is close (1.4 / 6.4 µs); cbor4ii and ciborium trail, routing through a
-  `&mut [u8]` `io::Write` one small write at a time. `serialized_size` is
-  effectively constant-time (sub-µs; ~1 ns for a byte string) — a primitive
-  unique to cbor2.
-- **No-alloc reads**: minicbor's `skip` stays faster than cbor2's `validate`,
-  but the two differ in *kind* — `validate` UTF-8-checks every text segment and
-  reads through a copying source, while `skip` just advances a borrowed cursor.
-  minicbor is also the only crate that decodes a *typed* value with no heap;
-  cbor2's `core::Decoder` covers the manual no-heap case (see the matrix).
-
-cbor2 is competitive across the board and **uniquely strong in
-`no_std + no_alloc`** (fixed-buffer encode, `validate`, `serialized_size`)
-while keeping its full feature set (canonical encoding, `Value`/`RawValue`,
-tags, COSE keys, diagnostics, async item I/O). **cbor4ii is the surprise on
-structured `std`/`alloc` throughput** — but it has no real no-alloc encode
-path, keeps floats at 64-bit, and its decoder rejects another crate's
-narrowed floats. minicbor's compact, borrowing design still leads structured
-decode.
+Compare crates within one API scenario and account for encoded shape.
+Integer arrays and blobs are checked for byte-identical output; log batches
+have different map/array layouts and float widths. Scan comparisons additionally
+have different validation contracts. Use a fresh recorded run for performance
+conclusions, and assess allocation counts separately from timing.
 
 <!-- RESULTS:END -->
 
@@ -257,6 +261,16 @@ records and 1,024-chunk strings. The fixtures keep the same logical and wire
 shape when comparing revisions. `parse_results.py` also emits these results
 and includes the `validate_slice` structural-scan column.
 
+`cargo bench --bench derive` compares integer-keyed derives and flattening
+with direct serialization of identical wire bytes. Both regression targets
+are included in the parser output.
+
+Comparison fixtures share an `Encoded` preparation helper. Before timing, it
+checks complete CBOR validity, slice/reader round trips, fixed-buffer output
+against each codec's vector encoding, and cbor2 size calculation. Integer and
+blob groups also assert cross-codec byte equality. Reused/fixed-buffer timings
+pass the encoded bytes through `black_box`, not just the output length.
+
 Allocation contracts are exercised by `cargo test -p cbor2 --all-features
 --test allocations`: raw sizing and caller-buffer writes allocate zero bytes,
 slice capture allocates one copy, and an array-shaped Value allocates one
@@ -265,7 +279,7 @@ container. Timing and allocation results should be assessed separately.
 ## Caveats
 
 - Each crate is benchmarked on **its own idiomatic encoding**, not on
-  byte-identical output: minicbor's integer-keyed arrays are smaller than the
+  byte-identical output: minicbor's positional arrays are smaller than the
   serde crates' text-keyed maps for `log_batch`. A smaller payload is part of
   what makes a codec fast, so this is intentional — but it means the
   `log_batch` row is not a same-bytes comparison.

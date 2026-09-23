@@ -2,7 +2,8 @@
 # Rust CBOR implementations. It is deliberately *detached* from the parent
 # cbor2 workspace (note the empty `[workspace]` table below) so that criterion
 # and the four comparison crates never enter the library's dependency graph,
-# its CI matrix, or its MSRV. Run it with:
+# its main CI matrix, or its MSRV. A separate stable-toolchain CI job only
+# checks the benchmark fixtures, targets and result parser. Run timings with:
 #
 #     cargo bench -p cbor2-bench            # from this directory
 #
@@ -24,7 +25,7 @@ description = "Comparative CBOR benchmarks for the cbor2 crate."
 # The fixtures library and the `sizes` binary have no benchmarks, but a
 # plain `cargo bench` would still run them under libtest, which rejects
 # criterion's flags (e.g. `--noplot`). Opt them out so `cargo bench` drives
-# only the three `harness = false` benchmark targets below.
+# only the five `harness = false` benchmark targets below.
 [lib]
 bench = false
 

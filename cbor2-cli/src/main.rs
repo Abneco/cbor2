@@ -20,7 +20,7 @@
 
 use std::env;
 use std::fs::File;
-use std::io::{self, BufReader, Cursor, Read, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 use std::process;
 
@@ -46,6 +46,7 @@ Input:
   argument containing a path separator is always a file path. `encode`
   reads JSON-compatible values or CDN text from a file or stdin only.
   Use --json or --diag/--cdn to restrict the accepted input syntax.
+  CBOR-reading commands read raw CBOR bytes from files and stdin.
   Output goes to stdout.
 
 Options:
@@ -56,6 +57,7 @@ Options:
       --json     With `decode`: print pretty JSON instead of diagnostic notation
                  With `encode`: read only JSON text
       --hex      With `encode`: print lowercase hex text instead of raw bytes
+      --         End options (e.g. cbor -- -Ds= for base64url input)
   -h, --help     Print this help
   -V, --version  Print the version
 
@@ -88,16 +90,29 @@ enum EncodeOutput {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EncodeInput {
-    Any,
     Json,
     Cdn,
 }
 
+struct Args {
+    command: Command,
+    decode_output: DecodeOutput,
+    encode_output: EncodeOutput,
+    encode_input: EncodeInput,
+    input: Option<String>,
+}
+
 fn main() {
-    let (command, decode_output, encode_output, encode_input, input) = parse_args();
+    let Args {
+        command,
+        decode_output,
+        encode_output,
+        encode_input,
+        input,
+    } = parse_args();
 
     let result = match command {
-        Command::Show => show(open_cbor_input(input.as_deref())),
+        Command::Show => decode(open_cbor_input(input.as_deref()), DecodeOutput::Diag),
         Command::Decode => decode(open_cbor_input(input.as_deref()), decode_output),
         Command::Encode => encode(
             open_text_input(input.as_deref()),
@@ -108,6 +123,9 @@ fn main() {
     };
 
     if let Err(err) = result {
+        if is_broken_pipe(err.as_ref()) {
+            return;
+        }
         eprintln!("cbor: {err}");
         process::exit(1);
     }
@@ -115,21 +133,22 @@ fn main() {
 
 // Parses the command line. `-h`/`--help` and `-V`/`--version` print and
 // exit; anything malformed exits with 2.
-fn parse_args() -> (
-    Command,
-    DecodeOutput,
-    EncodeOutput,
-    EncodeInput,
-    Option<String>,
-) {
+fn parse_args() -> Args {
     let mut diag = false;
     let mut cdn = false;
     let mut json = false;
     let mut encode_output = EncodeOutput::Raw;
     let mut positional = Vec::new();
+    let mut input_only = false;
 
-    for arg in env::args().skip(1) {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--" => {
+                input_only = positional.is_empty();
+                positional.extend(args);
+                break;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 process::exit(0);
@@ -150,7 +169,11 @@ fn parse_args() -> (
     }
 
     let mut positional = positional.into_iter().peekable();
-    let command = match positional.peek().map(String::as_str) {
+    let command = match positional
+        .peek()
+        .map(String::as_str)
+        .filter(|_| !input_only)
+    {
         Some("decode") => {
             positional.next();
             Command::Decode
@@ -183,12 +206,7 @@ fn parse_args() -> (
     if cdn && !matches!(command, Command::Decode | Command::Encode) {
         usage_error(format_args!("`--cdn` only applies to `decode` or `encode`"));
     }
-    if matches!(command, Command::Decode) && json && (diag || cdn) {
-        usage_error(format_args!(
-            "`--json` cannot be combined with `--diag` or `--cdn`"
-        ));
-    }
-    if matches!(command, Command::Encode) && json && (diag || cdn) {
+    if json && (diag || cdn) {
         usage_error(format_args!(
             "`--json` cannot be combined with `--diag` or `--cdn`"
         ));
@@ -205,13 +223,17 @@ fn parse_args() -> (
 
     let encode_input = if json {
         EncodeInput::Json
-    } else if diag || cdn {
-        EncodeInput::Cdn
     } else {
-        EncodeInput::Any
+        EncodeInput::Cdn
     };
 
-    (command, decode_output, encode_output, encode_input, input)
+    Args {
+        command,
+        decode_output,
+        encode_output,
+        encode_input,
+        input,
+    }
 }
 
 fn usage_error(msg: core::fmt::Arguments<'_>) -> ! {
@@ -237,7 +259,8 @@ fn open_cbor_input(arg: Option<&str>) -> Box<dyn Read> {
 
     // Anything with a path separator is always a path — `/` is also a
     // standard-base64 character, and a mistyped file name must not be
-    // decoded as inline data. Base64 containing `/` can come from stdin.
+    // decoded as inline data. Use base64url or externally decode to raw CBOR
+    // before piping to stdin when standard base64 contains `/`.
     if arg.contains('/') || arg.contains('\\') {
         usage_error(format_args!("{arg}: no such file"));
     }
@@ -267,11 +290,17 @@ fn open_text_input(arg: Option<&str>) -> Box<dyn Read> {
 
 type Error = Box<dyn std::error::Error>;
 
-// Pretty-prints each CBOR item in diagnostic notation, preserving wire
-// details: indefinite-length `_` markers, `undefined`, unassigned simple
-// values and bignums as plain integers.
-fn show(input: Box<dyn Read>) -> Result<(), Error> {
-    decode(input, DecodeOutput::Diag)
+// These serializers wrap output errors instead of always exposing io::Error
+// through Error::source. A consumer such as `head` may close stdout early.
+fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<io::Error>() {
+        return error.kind() == io::ErrorKind::BrokenPipe;
+    }
+    if let Some(error) = error.downcast_ref::<serde_json::Error>() {
+        return error.io_error_kind() == Some(io::ErrorKind::BrokenPipe);
+    }
+    matches!(error.downcast_ref::<cbor2::ser::Error>(),
+        Some(cbor2::ser::Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
 }
 
 // Decodes each CBOR item and pretty-prints it as diagnostic notation or, with
@@ -289,10 +318,15 @@ fn decode(input: Box<dyn Read>, output: DecodeOutput) -> Result<(), Error> {
             }
         }
         DecodeOutput::Json => {
+            let mut stdout = BufWriter::new(stdout);
             for item in cbor2::de::Deserializer::from_reader(input).into_iter::<Value>() {
-                serde_json::to_writer_pretty(&mut stdout, &to_json(item?))?;
+                let json = to_json(item?)?;
+                serde_json::to_writer_pretty(&mut stdout, &json)?;
                 stdout.write_all(b"\n")?;
+                // Keep complete items visible even while the input stays open.
+                stdout.flush()?;
             }
+            return Ok(stdout.flush()?);
         }
     }
 
@@ -334,7 +368,7 @@ fn encode(mut input: Box<dyn Read>, output: EncodeOutput, mode: EncodeInput) -> 
         match output {
             EncodeOutput::Raw => stdout.write_all(&bytes)?,
             EncodeOutput::Hex => {
-                write!(stdout, "{}", hex(&bytes))?;
+                write_hex(&mut stdout, &bytes)?;
                 stdout.write_all(b"\n")?;
             }
         }
@@ -346,7 +380,7 @@ fn encode(mut input: Box<dyn Read>, output: EncodeOutput, mode: EncodeInput) -> 
             EncodeOutput::Raw => cbor2::to_writer(&value?, &mut stdout)?,
             EncodeOutput::Hex => {
                 let item = cbor2::to_vec(&value?)?;
-                write!(stdout, "{}", hex(&item))?;
+                write_hex(&mut stdout, &item)?;
                 wrote_hex = true;
             }
         }
@@ -366,11 +400,12 @@ fn encode(mut input: Box<dyn Read>, output: EncodeOutput, mode: EncodeInput) -> 
 // JSON-encoded into strings, non-finite floats become null, tags are
 // dropped (the inner value is kept), generic simple values become
 // `simple(N)` strings, integers beyond the 64-bit ranges become strings
-// and the "undefined" simple value becomes null.
-fn to_json(value: Value) -> serde_json::Value {
+// and the "undefined" simple value becomes null. Colliding object keys are
+// rejected, including collisions in nested values or compound keys.
+fn to_json(value: Value) -> Result<serde_json::Value, Error> {
     use serde_json::Value as Json;
 
-    match value {
+    Ok(match value {
         Value::Null => Json::Null,
         Value::Bool(x) => Json::Bool(x),
         Value::Integer(x) => match (u64::try_from(x), i64::try_from(x)) {
@@ -383,30 +418,52 @@ fn to_json(value: Value) -> serde_json::Value {
         Value::Bytes(x) => Json::String(hex(&x)),
         Value::Text(x) => Json::String(x),
         Value::Simple(x) => Json::String(format!("simple({})", x.value())),
-        Value::Tag(_, x) => to_json(*x),
-        Value::Array(x) => Json::Array(x.into_iter().map(to_json).collect()),
-        Value::Map(x) => Json::Object(
-            x.into_iter()
-                .map(|(k, v)| {
-                    let key = match k {
-                        Value::Text(s) => s,
-                        // Serializing a serde_json::Value to a string cannot
-                        // fail; never fall back to an (ambiguous) empty key.
-                        other => serde_json::to_string(&to_json(other))
-                            .expect("serializing a JSON value cannot fail"),
-                    };
-                    (key, to_json(v))
-                })
-                .collect(),
-        ),
+        Value::Tag(_, x) => to_json(*x)?,
+        Value::Array(x) => Json::Array(x.into_iter().map(to_json).collect::<Result<_, _>>()?),
+        Value::Map(x) => {
+            let mut map = serde_json::Map::new();
+            for (key, value) in x {
+                let key = match key {
+                    Value::Text(s) => s,
+                    other => serde_json::to_string(&to_json(other)?)?,
+                };
+                match map.entry(key) {
+                    serde_json::map::Entry::Vacant(entry) => {
+                        entry.insert(to_json(value)?);
+                    }
+                    serde_json::map::Entry::Occupied(entry) => {
+                        return Err(format!(
+                            "duplicate JSON object key {:?} after CBOR key conversion",
+                            entry.key()
+                        )
+                        .into());
+                    }
+                }
+            }
+            Json::Object(map)
+        }
         _ => Json::Null,
+    })
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+// Bound temporary memory independently of the encoded item size.
+fn write_hex(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    let mut buffer = [0u8; 4096];
+    for chunk in bytes.chunks(buffer.len() / 2) {
+        for (byte, pair) in chunk.iter().zip(buffer.as_chunks_mut::<2>().0) {
+            pair[0] = HEX[(byte >> 4) as usize];
+            pair[1] = HEX[(byte & 15) as usize];
+        }
+        output.write_all(&buffer[..chunk.len() * 2])?;
     }
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
         out.push(char::from(HEX[(b >> 4) as usize]));
         out.push(char::from(HEX[(b & 15) as usize]));
     }
@@ -450,10 +507,17 @@ fn from_base64(text: &str) -> Option<Vec<u8>> {
         } as u32)
     }
 
-    let mut data: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    while data.last() == Some(&b'=') {
-        data.pop();
+    let data: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let unpadded = data.iter().position(|&b| b == b'=').unwrap_or(data.len());
+    let padding = data.len() - unpadded;
+    if padding > 0
+        && (padding > 2
+            || !data.len().is_multiple_of(4)
+            || data[unpadded..].iter().any(|&b| b != b'='))
+    {
+        return None;
     }
+    let data = &data[..unpadded];
     if data.is_empty() || data.len() % 4 == 1 {
         return None;
     }
@@ -466,8 +530,9 @@ fn from_base64(text: &str) -> Option<Vec<u8>> {
         }
         match chunk.len() {
             4 => out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]),
-            3 => out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]),
-            _ => out.push((acc >> 4) as u8), // chunks of 2; length 1 is rejected above
+            3 if acc & 3 == 0 => out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]),
+            2 if acc & 15 == 0 => out.push((acc >> 4) as u8),
+            _ => return None,
         }
     }
 

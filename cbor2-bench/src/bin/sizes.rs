@@ -1,66 +1,39 @@
-//! Prints the encoded byte size each crate produces for every fixture.
-//!
-//! Run with `cargo run --release --bin sizes`. The serde crates emit
-//! text-keyed maps for the log batch while minicbor emits a compact
-//! integer-keyed array, so the `log_batch` column is where sizes diverge.
+//! Prints checked encoded sizes. Run with `cargo run --release --bin sizes`.
+//! Log records use text-keyed maps in the serde crates and arrays in minicbor.
 
 use cbor2_bench::*;
 use serde_bytes::ByteBuf;
 
-fn ciborium_len<T: serde::Serialize>(v: &T) -> usize {
-    let mut buf = Vec::new();
-    ciborium::into_writer(v, &mut buf).unwrap();
-    buf.len()
-}
-
 fn main() {
     let ints = int_array(INT_ARRAY_LEN);
+    let ints = Encoded::new(&ints, &ints);
+    ints.assert_identical();
     let logs = log_batch(LOG_BATCH_LEN);
-    let logs_mini = log_batch_mini(&logs);
+    let logs = Encoded::new(&logs, &log_batch_mini(&logs));
     let raw = blob(BLOB_LEN);
-    let blob_serde = ByteBuf::from(raw.clone());
-    let blob_mini = minicbor::bytes::ByteVec::from(raw);
+    let blob = Encoded::new(
+        &ByteBuf::from(raw.clone()),
+        &minicbor::bytes::ByteVec::from(raw),
+    );
+    blob.assert_identical();
 
     println!(
         "{:<14} {:>12} {:>12} {:>12}",
         "crate", "int_array", "log_batch", "blob"
     );
     println!("{}", "-".repeat(54));
-
-    let row = |name: &str, a: usize, b: usize, c: usize| {
-        println!("{name:<14} {a:>12} {b:>12} {c:>12}");
-    };
-
-    row(
-        "cbor2",
-        cbor2::to_vec(&ints).unwrap().len(),
-        cbor2::to_vec(&logs).unwrap().len(),
-        cbor2::to_vec(&blob_serde).unwrap().len(),
-    );
-    row(
-        "ciborium",
-        ciborium_len(&ints),
-        ciborium_len(&logs),
-        ciborium_len(&blob_serde),
-    );
-    row(
-        "serde_cbor",
-        serde_cbor::to_vec(&ints).unwrap().len(),
-        serde_cbor::to_vec(&logs).unwrap().len(),
-        serde_cbor::to_vec(&blob_serde).unwrap().len(),
-    );
-    row(
-        "cbor4ii",
-        cbor4ii::serde::to_vec(Vec::new(), &ints).unwrap().len(),
-        cbor4ii::serde::to_vec(Vec::new(), &logs).unwrap().len(),
-        cbor4ii::serde::to_vec(Vec::new(), &blob_serde)
-            .unwrap()
-            .len(),
-    );
-    row(
-        "minicbor",
-        minicbor::to_vec(&ints).unwrap().len(),
-        minicbor::to_vec(&logs_mini).unwrap().len(),
-        minicbor::to_vec(&blob_mini).unwrap().len(),
-    );
+    for (name, a, b, c) in [
+        ("cbor2", &ints.cbor2, &logs.cbor2, &blob.cbor2),
+        ("ciborium", &ints.ciborium, &logs.ciborium, &blob.ciborium),
+        (
+            "serde_cbor",
+            &ints.serde_cbor,
+            &logs.serde_cbor,
+            &blob.serde_cbor,
+        ),
+        ("cbor4ii", &ints.cbor4ii, &logs.cbor4ii, &blob.cbor4ii),
+        ("minicbor", &ints.minicbor, &logs.minicbor, &blob.minicbor),
+    ] {
+        println!("{name:<14} {:>12} {:>12} {:>12}", a.len(), b.len(), c.len());
+    }
 }

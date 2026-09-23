@@ -7,7 +7,7 @@
 //! * [`log_batch`] / [`log_batch_mini`] — a batch of structured telemetry
 //!   records mixing text, integers, floats, booleans and nested lists: the
 //!   "real document" case. The serde crates encode it as text-keyed maps;
-//!   minicbor uses its idiomatic integer-keyed array form. Each crate is
+//!   minicbor uses its idiomatic positional array form. Each crate is
 //!   benchmarked on its *own* natural encoding, so the byte sizes differ
 //!   slightly — that is part of what the comparison shows.
 //! * [`blob`] — a single large byte string (major type 2), the COSE /
@@ -48,7 +48,7 @@ pub struct LogEntry {
     pub labels: Vec<String>,
 }
 
-/// The same record for minicbor, encoded as an integer-keyed CBOR array
+/// The same record for minicbor, encoded as a positional CBOR array
 /// (`#[cbor(array)]`) — minicbor's idiomatic, compact form.
 #[derive(Clone, Debug, PartialEq, minicbor::Encode, minicbor::Decode)]
 #[cbor(array)]
@@ -190,3 +190,130 @@ pub fn blob(n: usize) -> Vec<u8> {
 pub const LOG_BATCH_LEN: usize = 128;
 pub const INT_ARRAY_LEN: usize = 1024;
 pub const BLOB_LEN: usize = 4096;
+
+/// Reused fixed-buffer capacity for the comparison fixtures.
+pub const FIXED_CAPACITY: usize = 64 * 1024;
+
+/// Ciborium exposes a writer API rather than a `to_vec` convenience function.
+pub fn ciborium_to_vec<T: Serialize>(value: &T) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(value, &mut bytes).unwrap();
+    bytes
+}
+
+/// Each decoder reads its own crate's encoding. Preparation and correctness
+/// assertions run outside the timed loops; the benchmark calls stay explicit.
+pub struct Encoded {
+    pub cbor2: Vec<u8>,
+    pub ciborium: Vec<u8>,
+    pub serde_cbor: Vec<u8>,
+    pub cbor4ii: Vec<u8>,
+    pub minicbor: Vec<u8>,
+}
+
+impl Encoded {
+    pub fn new<T, M>(value: &T, mini: &M) -> Self
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        M: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + std::fmt::Debug,
+    {
+        let encoded = Self {
+            cbor2: cbor2::to_vec(value).unwrap(),
+            ciborium: ciborium_to_vec(value),
+            serde_cbor: serde_cbor::to_vec(value).unwrap(),
+            cbor4ii: cbor4ii::serde::to_vec(Vec::new(), value).unwrap(),
+            minicbor: minicbor::to_vec(mini).unwrap(),
+        };
+        for bytes in [
+            &encoded.cbor2,
+            &encoded.ciborium,
+            &encoded.serde_cbor,
+            &encoded.cbor4ii,
+            &encoded.minicbor,
+        ] {
+            cbor2::validate_slice(bytes).unwrap();
+        }
+        assert_eq!(&cbor2::from_slice::<T>(&encoded.cbor2).unwrap(), value);
+        assert_eq!(
+            &cbor2::from_reader::<T, _>(encoded.cbor2.as_slice()).unwrap(),
+            value
+        );
+        assert_eq!(
+            &ciborium::from_reader::<T, _>(encoded.ciborium.as_slice()).unwrap(),
+            value
+        );
+        assert_eq!(
+            &serde_cbor::from_slice::<T>(&encoded.serde_cbor).unwrap(),
+            value
+        );
+        assert_eq!(
+            &serde_cbor::from_reader::<T, _>(encoded.serde_cbor.as_slice()).unwrap(),
+            value
+        );
+        assert_eq!(
+            &cbor4ii::serde::from_slice::<T>(&encoded.cbor4ii).unwrap(),
+            value
+        );
+        assert_eq!(
+            &cbor4ii::serde::from_reader::<T, _>(encoded.cbor4ii.as_slice()).unwrap(),
+            value
+        );
+        assert_eq!(&minicbor::decode::<M>(&encoded.minicbor).unwrap(), mini);
+
+        let mut buffer = vec![0; FIXED_CAPACITY];
+        assert_eq!(cbor2::to_slice(value, &mut buffer).unwrap(), encoded.cbor2);
+        let mut slice = buffer.as_mut_slice();
+        ciborium::into_writer(value, &mut slice).unwrap();
+        let len = FIXED_CAPACITY - slice.len();
+        assert_eq!(buffer[..len], encoded.ciborium);
+        let mut serializer =
+            serde_cbor::Serializer::new(serde_cbor::ser::SliceWrite::new(&mut buffer));
+        value.serialize(&mut serializer).unwrap();
+        let len = serializer.into_inner().bytes_written();
+        assert_eq!(buffer[..len], encoded.serde_cbor);
+        let mut slice = buffer.as_mut_slice();
+        cbor4ii::serde::to_writer(&mut slice, value).unwrap();
+        let len = FIXED_CAPACITY - slice.len();
+        assert_eq!(buffer[..len], encoded.cbor4ii);
+        let mut cursor = minicbor::encode::write::Cursor::new(buffer.as_mut_slice());
+        minicbor::encode(mini, &mut cursor).unwrap();
+        let len = cursor.position();
+        assert_eq!(buffer[..len], encoded.minicbor);
+        assert_eq!(
+            cbor2::serialized_size(value).unwrap(),
+            encoded.cbor2.len() as u64
+        );
+        encoded
+    }
+
+    /// Integer-array and blob fixtures have the same wire format in every crate.
+    pub fn assert_identical(&self) {
+        for bytes in [
+            &self.ciborium,
+            &self.serde_cbor,
+            &self.cbor4ii,
+            &self.minicbor,
+        ] {
+            assert_eq!(bytes, &self.cbor2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixtures_round_trip_and_fixed_buffers_match() {
+        let ints = int_array(INT_ARRAY_LEN);
+        Encoded::new(&ints, &ints).assert_identical();
+        let logs = log_batch(LOG_BATCH_LEN);
+        Encoded::new(&logs, &log_batch_mini(&logs));
+        let raw = blob(BLOB_LEN);
+        Encoded::new(
+            &serde_bytes::ByteBuf::from(raw.clone()),
+            &minicbor::bytes::ByteVec::from(raw),
+        )
+        .assert_identical();
+    }
+}

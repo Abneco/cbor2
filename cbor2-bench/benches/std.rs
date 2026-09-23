@@ -7,10 +7,8 @@
 //! whose copying source is the distinctive `std` cost versus a borrowed
 //! slice.
 //!
-//! Two crates have no streaming form and fall back to their slice APIs, which
-//! is itself worth seeing: **ciborium** is reader-only (its `from_reader` is
-//! the same call the other scenarios use), and **minicbor** is slice-only (it
-//! has no `io::Read` decoder at all).
+//! Ciborium uses its reader API in every scenario. Minicbor has no `io::Read`
+//! decoder, so its decode measurements use its slice API here too.
 
 use std::hint::black_box;
 
@@ -20,16 +18,20 @@ use serde_bytes::ByteBuf;
 
 fn bench_encode(c: &mut Criterion) {
     macro_rules! encode_group {
-        ($name:literal, $serde:expr, $mini:expr) => {{
+        ($name:literal, $identical:literal, $serde:expr, $mini:expr) => {{
             let data = $serde;
             let mini = $mini;
+            let encoded = Encoded::new(&data, &mini);
+            if $identical {
+                encoded.assert_identical();
+            }
             let mut g = c.benchmark_group($name);
             g.bench_function("cbor2", |b| {
                 let mut buf = Vec::new();
                 b.iter(|| {
                     buf.clear();
                     cbor2::to_writer(black_box(&data), &mut buf).unwrap();
-                    black_box(buf.len())
+                    black_box(buf.as_slice());
                 })
             });
             g.bench_function("ciborium", |b| {
@@ -37,7 +39,7 @@ fn bench_encode(c: &mut Criterion) {
                 b.iter(|| {
                     buf.clear();
                     ciborium::into_writer(black_box(&data), &mut buf).unwrap();
-                    black_box(buf.len())
+                    black_box(buf.as_slice());
                 })
             });
             g.bench_function("serde_cbor", |b| {
@@ -45,7 +47,7 @@ fn bench_encode(c: &mut Criterion) {
                 b.iter(|| {
                     buf.clear();
                     serde_cbor::to_writer(&mut buf, black_box(&data)).unwrap();
-                    black_box(buf.len())
+                    black_box(buf.as_slice());
                 })
             });
             g.bench_function("cbor4ii", |b| {
@@ -53,7 +55,7 @@ fn bench_encode(c: &mut Criterion) {
                 b.iter(|| {
                     buf.clear();
                     cbor4ii::serde::to_writer(&mut buf, black_box(&data)).unwrap();
-                    black_box(buf.len())
+                    black_box(buf.as_slice());
                 })
             });
             g.bench_function("minicbor", |b| {
@@ -61,7 +63,7 @@ fn bench_encode(c: &mut Criterion) {
                 b.iter(|| {
                     buf.clear();
                     minicbor::encode(black_box(&mini), &mut buf).unwrap();
-                    black_box(buf.len())
+                    black_box(buf.as_slice());
                 })
             });
             g.finish();
@@ -74,12 +76,14 @@ fn bench_encode(c: &mut Criterion) {
 
     encode_group!(
         "std/encode/int_array",
+        true,
         int_array(INT_ARRAY_LEN),
         int_array(INT_ARRAY_LEN)
     );
-    encode_group!("std/encode/log_batch", logs, logs_mini);
+    encode_group!("std/encode/log_batch", false, logs, logs_mini);
     encode_group!(
         "std/encode/blob",
+        true,
         ByteBuf::from(raw.clone()),
         minicbor::bytes::ByteVec::from(raw)
     );
@@ -87,37 +91,34 @@ fn bench_encode(c: &mut Criterion) {
 
 fn bench_decode(c: &mut Criterion) {
     macro_rules! decode_group {
-        ($name:literal, $ty:ty, $mty:ty, $serde:expr, $mini:expr) => {{
+        ($name:literal, $identical:literal, $ty:ty, $mty:ty, $serde:expr, $mini:expr) => {{
             let value = $serde;
             let mini = $mini;
-            // Each decoder reads bytes it produced itself: crates differ in
-            // preferred encoding (e.g. cbor2 narrows floats to f32, which
-            // cbor4ii's decoder rejects for an f64 field), so a shared buffer
-            // is not portable.
-            let b_cbor2 = cbor2::to_vec(&value).unwrap();
-            let b_ciborium = {
-                let mut v = Vec::new();
-                ciborium::into_writer(&value, &mut v).unwrap();
-                v
-            };
-            let b_serde = serde_cbor::to_vec(&value).unwrap();
-            let b_cbor4ii = cbor4ii::serde::to_vec(Vec::new(), &value).unwrap();
-            let b_mini = minicbor::to_vec(&mini).unwrap();
+            let encoded = Encoded::new(&value, &mini);
+            if $identical {
+                encoded.assert_identical();
+            }
             let mut g = c.benchmark_group($name);
             g.bench_function("cbor2", |x| {
-                x.iter(|| cbor2::from_reader::<$ty, _>(black_box(&b_cbor2[..])).unwrap())
+                x.iter(|| cbor2::from_reader::<$ty, _>(black_box(&encoded.cbor2[..])).unwrap())
             });
             g.bench_function("ciborium", |x| {
-                x.iter(|| ciborium::from_reader::<$ty, _>(black_box(&b_ciborium[..])).unwrap())
+                x.iter(|| {
+                    ciborium::from_reader::<$ty, _>(black_box(&encoded.ciborium[..])).unwrap()
+                })
             });
             g.bench_function("serde_cbor", |x| {
-                x.iter(|| serde_cbor::from_reader::<$ty, _>(black_box(&b_serde[..])).unwrap())
+                x.iter(|| {
+                    serde_cbor::from_reader::<$ty, _>(black_box(&encoded.serde_cbor[..])).unwrap()
+                })
             });
             g.bench_function("cbor4ii", |x| {
-                x.iter(|| cbor4ii::serde::from_reader::<$ty, _>(black_box(&b_cbor4ii[..])).unwrap())
+                x.iter(|| {
+                    cbor4ii::serde::from_reader::<$ty, _>(black_box(&encoded.cbor4ii[..])).unwrap()
+                })
             });
             g.bench_function("minicbor", |x| {
-                x.iter(|| minicbor::decode::<$mty>(black_box(&b_mini)).unwrap())
+                x.iter(|| minicbor::decode::<$mty>(black_box(&encoded.minicbor)).unwrap())
             });
             g.finish();
         }};
@@ -129,6 +130,7 @@ fn bench_decode(c: &mut Criterion) {
 
     decode_group!(
         "std/decode/int_array",
+        true,
         Vec<u64>,
         Vec<u64>,
         int_array(INT_ARRAY_LEN),
@@ -136,6 +138,7 @@ fn bench_decode(c: &mut Criterion) {
     );
     decode_group!(
         "std/decode/log_batch",
+        false,
         Vec<LogEntry>,
         Vec<LogEntryMini>,
         logs,
@@ -143,6 +146,7 @@ fn bench_decode(c: &mut Criterion) {
     );
     decode_group!(
         "std/decode/blob",
+        true,
         ByteBuf,
         minicbor::bytes::ByteVec,
         ByteBuf::from(raw.clone()),

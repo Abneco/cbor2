@@ -54,6 +54,7 @@ you are an AI/code agent working in a terminal transcript:
 | Task | Command |
 | --- | --- |
 | Inspect pasted CBOR hex/base64 or a file | `cbor <INPUT>` |
+| Inspect base64url starting with `-` | `cbor -- -Ds=` (shows `simple(59)`) |
 | Convert CBOR to JSON for jq-like tools | `cbor decode --json <INPUT>` |
 | Preserve wire details while pretty-printing | `cbor decode <INPUT>` or bare `cbor <INPUT>` |
 | Convert JSON to copyable CBOR bytes | `echo '{"a":1}' \| cbor encode --json --hex` |
@@ -65,6 +66,26 @@ For agent-generated examples, prefer `cbor encode --hex` over raw
 `cbor encode`; raw binary stdout is hard to quote, diff and paste reliably.
 Use `--json` when the input is intended to be strict JSON, or `--diag`/`--cdn`
 when it is intended to be CDN.
+
+CLI behavior to preserve:
+
+- Hex/base64 detection applies only to inline arguments. CBOR-reading commands
+  read raw CBOR bytes from files and stdin. Arguments containing `/` or `\`
+  are paths; use base64url or externally decode standard base64 containing `/`.
+  Use `--` before an input starting with `-`. Base64 accepts correct padding
+  or no padding and requires zero unused tail bits.
+- `decode --json` is a lossy projection. If CBOR map keys become the same JSON
+  object key (including duplicate text keys), fail with status 1 instead of
+  overwriting a value. Do not output the failing item; earlier sequence items
+  may already have been written. Use diagnostic output to inspect such maps.
+- Decode, validation and `encode --json` process one item at a time. Default
+  CDN encoding reads the whole source before parsing. Keep JSON output
+  buffered and flush each complete item before waiting for the next one;
+  keep `encode --hex` output scratch space bounded rather than building a
+  second, full-size hex string.
+- Data errors exit with status 1 and usage errors with status 2. A downstream
+  consumer closing the output pipe ends quietly with success; recognize
+  `BrokenPipe` wrapped by serde_json or cbor2 as well as direct I/O errors.
 
 ## Non-Negotiable Semantics
 
@@ -135,6 +156,28 @@ See `docs/agent-cookbook.md` for copyable recipes and common mistakes.
 Run `cargo run --example agent_patterns` for a compact executable tour of the
 rules above.
 
+## Benchmark Maintenance
+
+`cbor2-bench` is a separate workspace with five targets: `alloc`, `std`,
+`no_alloc`, `focused` and `derive`. Root workspace checks do not cover it.
+
+- Reuse `cbor2_bench::Encoded` for comparison fixture preparation. Keep
+  round-trip, exact-item, fixed-buffer and size assertions outside timed loops.
+  Assert cross-codec byte equality for integer arrays and blobs; log records
+  intentionally use different map/array layouts and float widths.
+- Pass the actual encoded bytes to `black_box` in reused/fixed-buffer encode
+  loops, not just their length. Keep each codec's timed API call explicit.
+- These are host API-path measurements, not proof of `no_std` compatibility.
+  Distinguish zero allocations during a workload from building without
+  `alloc` support, and verify capability claims against the pinned versions.
+- Criterion's printed time is a slope/mean point estimate, not a median.
+  `parse_results.py` must handle all five targets and clear pending identities
+  after consuming a time or encountering an unknown group. Missing results
+  stay missing; never attribute them to the preceding benchmark.
+- For published comparisons, retain the commit, toolchain, command, lockfile
+  snapshot and raw logs using the recipe in `cbor2-bench/README.md`. Label old
+  timings as historical until rerun; smoke tests do not establish rankings.
+
 ## Verification
 
 For changes that affect public API, docs, or examples, use the relevant subset
@@ -149,3 +192,19 @@ cargo test -p cbor2 --no-default-features --features alloc --lib
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 ```
+
+For CLI behavior changes, run `cargo test -p cbor2-cli`; use
+`cargo +1.89 test -p cbor2-cli --locked` when checking the declared MSRV.
+For benchmark or result-parser changes, run these separately from the
+repository root (the test command smoke-runs all five targets without timing):
+
+```bash
+cargo fmt --manifest-path cbor2-bench/Cargo.toml --all --check
+cargo test --manifest-path cbor2-bench/Cargo.toml --all-targets
+cargo clippy --manifest-path cbor2-bench/Cargo.toml --all-targets -- -D warnings
+python3 -B -m unittest discover -s cbor2-bench -p 'test_*.py'
+```
+
+Run release benchmarks for affected workloads when changing their measured
+paths. The separate stable-toolchain benchmark CI job only checks correctness,
+formatting and lint; it does not collect performance results.

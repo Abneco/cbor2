@@ -9,7 +9,7 @@ pub(super) fn build(
     attrs: &SerdeAttrs,
     groups: &[FieldGroup<'_>],
 ) -> (syn::Generics, syn::Generics, syn::Lifetime) {
-    let lifetime = super::fresh_de_lifetime(&input.generics);
+    let lifetime = super::fresh_lifetime(&input.generics, "__de");
     let mut ser = input.generics.clone();
     let mut de = input.generics.clone();
 

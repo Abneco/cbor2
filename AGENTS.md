@@ -74,15 +74,16 @@ CLI behavior to preserve:
   are paths; use base64url or externally decode standard base64 containing `/`.
   Use `--` before an input starting with `-`. Base64 accepts correct padding
   or no padding and requires zero unused tail bits.
-- `decode --json` is a lossy projection. If CBOR map keys become the same JSON
-  object key (including duplicate text keys), fail with status 1 instead of
-  overwriting a value. Do not output the failing item; earlier sequence items
+- `decode --json` is a lossy projection that keeps CBOR map order. If CBOR
+  map keys become the same JSON object key (including duplicate text keys),
+  fail with status 1 instead of overwriting a value. Do not output the failing item; earlier sequence items
   may already have been written. Use diagnostic output to inspect such maps.
 - Decode, validation and `encode --json` process one item at a time. Default
-  CDN encoding reads the whole source before parsing. Keep JSON output
-  buffered and flush each complete item before waiting for the next one;
-  keep `encode --hex` output scratch space bounded rather than building a
-  second, full-size hex string.
+  CDN encoding reads the whole source before parsing. `encode --json` keeps
+  JSON member order and duplicate names, producing the same bytes as CDN
+  input. Keep streaming output buffered and flush complete items before
+  reading more input (not after every item); keep `encode --hex` output
+  scratch space bounded rather than building a second, full-size hex string.
 - Data errors exit with status 1 and usage errors with status 2. A downstream
   consumer closing the output pipe ends quietly with success; recognize
   `BrokenPipe` wrapped by serde_json or cbor2 as well as direct I/O errors.
@@ -161,8 +162,9 @@ rules above.
 `cbor2-bench` is a separate workspace with five targets: `alloc`, `std`,
 `no_alloc`, `focused` and `derive`. Root workspace checks do not cover it.
 
-- Reuse `cbor2_bench::Encoded` for comparison fixture preparation. Keep
-  round-trip, exact-item, fixed-buffer and size assertions outside timed loops.
+- Reuse `cbor2_bench::Fixtures` (payloads with checked `Encoded` bytes) for
+  comparison fixture preparation. Keep round-trip, exact-item, fixed-buffer
+  and size assertions outside timed loops.
   Assert cross-codec byte equality for integer arrays and blobs; log records
   intentionally use different map/array layouts and float widths.
 - Pass the actual encoded bytes to `black_box` in reused/fixed-buffer encode

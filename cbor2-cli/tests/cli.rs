@@ -153,37 +153,70 @@ fn hex_output_handles_large_items_and_sequences() {
             bytes
         );
     }
-    assert!(ok(&["encode", "--json", "--hex"], b"").is_empty());
+    // An empty sequence is an empty hex line in both input modes.
+    assert_eq!(ok(&["encode", "--json", "--hex"], b""), b"\n");
     assert_eq!(ok(&["encode", "--cdn", "--hex"], b""), b"\n");
 }
 
 #[test]
-fn json_decode_flushes_each_item_before_input_eof() {
-    use std::io::{BufRead, BufReader};
-    let mut child = Command::new(CBOR)
-        .args(["decode", "--json"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let (send, recv) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut line = String::new();
-        BufReader::new(stdout).read_line(&mut line).unwrap();
-        send.send(line).unwrap();
-    });
-    stdin.write_all(&[1]).unwrap();
-    let line = recv.recv_timeout(std::time::Duration::from_secs(5));
-    // Always close stdin and reap the child, including on a flush regression.
-    drop(stdin);
-    let out = child.wait_with_output().unwrap();
-    reader.join().unwrap();
-    assert_eq!(line.unwrap(), "1\n");
-    assert!(out.status.success());
-    assert!(out.stderr.is_empty());
+fn json_conversion_keeps_map_order() {
+    // CBOR map order survives JSON output, including converted keys.
+    assert_eq!(
+        ok(&["decode", "--json", "a3010203262001"], b""),
+        b"{\n  \"1\": 2,\n  \"3\": -7,\n  \"-1\": 1\n}\n"
+    );
+    assert_eq!(
+        ok(&["decode", "--json", "a2616201616102"], b""),
+        b"{\n  \"b\": 1,\n  \"a\": 2\n}\n"
+    );
+
+    // JSON input keeps member order and duplicate names, exactly like the
+    // CDN parser reading the same text.
+    for (json, expected) in [
+        (&br#"{"b": 1, "a": 2}"#[..], &b"a2616201616102\n"[..]),
+        (br#"{"a": 1, "a": 2}"#, b"a2616101616102\n"),
+        (br#"[{"z": null, "y": [true]}]"#, b"81a2617af6617981f5\n"),
+    ] {
+        assert_eq!(ok(&["encode", "--json", "--hex"], json), expected);
+        assert_eq!(ok(&["encode", "--cdn", "--hex"], json), expected);
+    }
+}
+
+#[test]
+fn streaming_commands_flush_each_item_before_input_eof() {
+    use std::io::Read as _;
+    for (args, input, expected) in [
+        (&["decode"][..], &[1u8][..], &b"1\n"[..]),
+        (&["decode", "--json"][..], &[1], b"1\n"),
+        (&["encode", "--json"][..], b"1 ", &[1]),
+        (&["encode", "--json", "--hex"][..], b"1 ", b"01"),
+    ] {
+        let mut child = Command::new(CBOR)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let len = expected.len();
+        let reader = std::thread::spawn(move || {
+            let mut output = vec![0; len];
+            stdout.read_exact(&mut output).unwrap();
+            send.send(output).unwrap();
+        });
+        stdin.write_all(input).unwrap();
+        let output = recv.recv_timeout(std::time::Duration::from_secs(5));
+        // Always close stdin and reap the child, including on a flush regression.
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        reader.join().unwrap();
+        assert_eq!(output.unwrap(), expected, "{args:?}");
+        assert!(out.status.success(), "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?}");
+    }
 }
 
 #[test]
@@ -195,6 +228,8 @@ fn closing_the_output_pipe_is_not_a_data_error() {
         (&["decode", "--json"][..], bytes.as_slice()),
         (&["encode", "--json"][..], json.as_bytes()),
         (&["encode", "--json", "--hex"][..], json.as_bytes()),
+        (&["encode"][..], json.as_bytes()),
+        (&["encode", "--hex"][..], json.as_bytes()),
     ] {
         let mut child = Command::new(CBOR)
             .args(args)
@@ -349,6 +384,7 @@ fn help_and_version_print_and_exit_cleanly() {
 
 #[test]
 fn usage_errors_exit_with_status_2() {
+    let dir = env!("CARGO_MANIFEST_DIR");
     // An unknown option, too many arguments, flags on the wrong command, an
     // unreadable input and something that is no known input form.
     for args in [
@@ -364,6 +400,10 @@ fn usage_errors_exit_with_status_2() {
         &["encode", "--json", "--diag"][..],
         &["encode", "--json", "--cdn"][..],
         &["/nonexistent/cbor_cli_test"][..],
+        // A directory is an unreadable input on every platform.
+        &[dir][..],
+        &["decode", dir][..],
+        &["encode", dir][..],
         // `/` makes it a path, even though it is valid standard base64.
         &["Q/vvvg=="][..],
         &["not hex, not base64!"][..],

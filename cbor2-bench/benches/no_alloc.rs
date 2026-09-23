@@ -33,156 +33,113 @@ use std::hint::black_box;
 use cbor2_bench::*;
 use criterion::{criterion_group, criterion_main, Criterion};
 use serde::Serialize;
-use serde_bytes::ByteBuf;
 
 /// Reused scratch buffer, sized once to fit the largest fixture.
 const CAP: usize = FIXED_CAPACITY;
 
-fn bench_encode(c: &mut Criterion) {
-    macro_rules! encode_group {
-        ($name:literal, $identical:literal, $serde:expr, $mini:expr) => {{
-            let data = $serde;
-            let mini = $mini;
-            let encoded = Encoded::new(&data, &mini);
-            if $identical {
-                encoded.assert_identical();
-            }
-            let mut g = c.benchmark_group($name);
-            g.bench_function("cbor2", |b| {
-                let mut buf = vec![0u8; CAP];
-                b.iter(|| {
-                    black_box(cbor2::to_slice(black_box(&data), &mut buf).unwrap());
-                })
-            });
-            g.bench_function("ciborium", |b| {
-                let mut buf = vec![0u8; CAP];
-                b.iter(|| {
-                    let mut slice: &mut [u8] = &mut buf[..];
-                    ciborium::into_writer(black_box(&data), &mut slice).unwrap();
-                    let len = CAP - slice.len();
-                    black_box(&buf[..len]);
-                })
-            });
-            g.bench_function("serde_cbor", |b| {
-                let mut buf = vec![0u8; CAP];
-                b.iter(|| {
-                    let mut ser =
-                        serde_cbor::Serializer::new(serde_cbor::ser::SliceWrite::new(&mut buf));
-                    black_box(&data).serialize(&mut ser).unwrap();
-                    let len = ser.into_inner().bytes_written();
-                    black_box(&buf[..len]);
-                })
-            });
-            g.bench_function("cbor4ii", |b| {
-                let mut buf = vec![0u8; CAP];
-                b.iter(|| {
-                    // cbor4ii has no public no_std slice serializer, but its
-                    // `to_writer` over a `&mut [u8]` (std::io::Write) encodes
-                    // into the fixed buffer without allocating.
-                    let mut slice: &mut [u8] = &mut buf[..];
-                    cbor4ii::serde::to_writer(&mut slice, black_box(&data)).unwrap();
-                    let len = CAP - slice.len();
-                    black_box(&buf[..len]);
-                })
-            });
-            g.bench_function("minicbor", |b| {
-                let mut buf = vec![0u8; CAP];
-                b.iter(|| {
-                    let mut cur = minicbor::encode::write::Cursor::new(&mut buf[..]);
-                    minicbor::encode(black_box(&mini), &mut cur).unwrap();
-                    let len = cur.position();
-                    black_box(&buf[..len]);
-                })
-            });
-            g.finish();
-        }};
-    }
-
-    let logs = log_batch(LOG_BATCH_LEN);
-    let logs_mini = log_batch_mini(&logs);
-    let raw = blob(BLOB_LEN);
-
-    encode_group!(
-        "no_alloc/encode/int_array",
-        true,
-        int_array(INT_ARRAY_LEN),
-        int_array(INT_ARRAY_LEN)
-    );
-    encode_group!("no_alloc/encode/log_batch", false, logs, logs_mini);
-    encode_group!(
-        "no_alloc/encode/blob",
-        true,
-        ByteBuf::from(raw.clone()),
-        minicbor::bytes::ByteVec::from(raw)
-    );
+fn encode<T: Serialize, M: minicbor::Encode<()>>(c: &mut Criterion, payload: &Payload<T, M>) {
+    let Payload {
+        name, value, mini, ..
+    } = payload;
+    let mut g = c.benchmark_group(format!("no_alloc/encode/{name}"));
+    g.bench_function("cbor2", |b| {
+        let mut buf = vec![0u8; CAP];
+        b.iter(|| {
+            black_box(cbor2::to_slice(black_box(value), &mut buf).unwrap());
+        })
+    });
+    g.bench_function("ciborium", |b| {
+        let mut buf = vec![0u8; CAP];
+        b.iter(|| {
+            let mut slice: &mut [u8] = &mut buf[..];
+            ciborium::into_writer(black_box(value), &mut slice).unwrap();
+            let len = CAP - slice.len();
+            black_box(&buf[..len]);
+        })
+    });
+    g.bench_function("serde_cbor", |b| {
+        let mut buf = vec![0u8; CAP];
+        b.iter(|| {
+            let mut ser = serde_cbor::Serializer::new(serde_cbor::ser::SliceWrite::new(&mut buf));
+            black_box(value).serialize(&mut ser).unwrap();
+            let len = ser.into_inner().bytes_written();
+            black_box(&buf[..len]);
+        })
+    });
+    g.bench_function("cbor4ii", |b| {
+        let mut buf = vec![0u8; CAP];
+        b.iter(|| {
+            // cbor4ii has no public no_std slice serializer, but its
+            // `to_writer` over a `&mut [u8]` (std::io::Write) encodes
+            // into the fixed buffer without allocating.
+            let mut slice: &mut [u8] = &mut buf[..];
+            cbor4ii::serde::to_writer(&mut slice, black_box(value)).unwrap();
+            let len = CAP - slice.len();
+            black_box(&buf[..len]);
+        })
+    });
+    g.bench_function("minicbor", |b| {
+        let mut buf = vec![0u8; CAP];
+        b.iter(|| {
+            let mut cur = minicbor::encode::write::Cursor::new(&mut buf[..]);
+            minicbor::encode(black_box(mini), &mut cur).unwrap();
+            let len = cur.position();
+            black_box(&buf[..len]);
+        })
+    });
+    g.finish();
 }
 
 /// No-alloc structural reads: prove well-formedness / skip one item without
 /// building a value. These groups cover the cbor2 and minicbor primitives.
-fn bench_scan(c: &mut Criterion) {
-    macro_rules! scan_group {
-        ($name:literal, $identical:literal, $serde:expr, $mini:expr) => {{
-            let encoded = Encoded::new(&$serde, &$mini);
-            if $identical {
-                encoded.assert_identical();
-            }
-            let bytes = encoded.cbor2;
-            let bytes_mini = encoded.minicbor;
-            let mut g = c.benchmark_group($name);
-            g.bench_function("cbor2 (validate)", |x| {
-                x.iter(|| cbor2::validate(black_box(&bytes[..])).unwrap())
-            });
-            g.bench_function("cbor2 (validate_slice)", |x| {
-                x.iter(|| cbor2::validate_slice(black_box(&bytes[..])).unwrap())
-            });
-            g.bench_function("minicbor (skip)", |x| {
-                x.iter(|| {
-                    let mut d = minicbor::Decoder::new(black_box(&bytes_mini));
-                    d.skip().unwrap()
-                })
-            });
-            g.finish();
-        }};
-    }
-
-    let logs = log_batch(LOG_BATCH_LEN);
-    let logs_mini = log_batch_mini(&logs);
-    let raw = blob(BLOB_LEN);
-
-    scan_group!(
-        "no_alloc/scan/int_array",
-        true,
-        int_array(INT_ARRAY_LEN),
-        int_array(INT_ARRAY_LEN)
-    );
-    scan_group!("no_alloc/scan/log_batch", false, logs, logs_mini);
-    scan_group!(
-        "no_alloc/scan/blob",
-        true,
-        ByteBuf::from(raw.clone()),
-        minicbor::bytes::ByteVec::from(raw)
-    );
+fn scan<T, M>(c: &mut Criterion, payload: &Payload<T, M>) {
+    let Payload { name, encoded, .. } = payload;
+    let (bytes, bytes_mini) = (&encoded.cbor2, &encoded.minicbor);
+    let mut g = c.benchmark_group(format!("no_alloc/scan/{name}"));
+    g.bench_function("cbor2 (validate)", |x| {
+        x.iter(|| cbor2::validate(black_box(&bytes[..])).unwrap())
+    });
+    g.bench_function("cbor2 (validate_slice)", |x| {
+        x.iter(|| cbor2::validate_slice(black_box(&bytes[..])).unwrap())
+    });
+    g.bench_function("minicbor (skip)", |x| {
+        x.iter(|| {
+            let mut d = minicbor::Decoder::new(black_box(bytes_mini));
+            d.skip().unwrap()
+        })
+    });
+    g.finish();
 }
 
 /// `cbor2::serialized_size` computes the exact encoded length with no output
 /// buffer and no allocation. Minicbor offers separate `CborLen` / `len` APIs;
 /// this group measures cbor2 only, across the three payloads.
-fn bench_serialized_size(c: &mut Criterion) {
-    let logs = log_batch(LOG_BATCH_LEN);
-    let ints = int_array(INT_ARRAY_LEN);
-    let blob = ByteBuf::from(blob(BLOB_LEN));
+fn bench_serialized_size(c: &mut Criterion, fixtures: &Fixtures) {
+    let Fixtures { ints, logs, blob } = fixtures;
     let mut g = c.benchmark_group("no_alloc/serialized_size (cbor2)");
     g.bench_function("int_array", |x| {
-        x.iter(|| cbor2::serialized_size(black_box(&ints)).unwrap())
+        x.iter(|| cbor2::serialized_size(black_box(&ints.value)).unwrap())
     });
     g.bench_function("log_batch", |x| {
-        x.iter(|| cbor2::serialized_size(black_box(&logs)).unwrap())
+        x.iter(|| cbor2::serialized_size(black_box(&logs.value)).unwrap())
     });
     g.bench_function("blob", |x| {
-        x.iter(|| cbor2::serialized_size(black_box(&blob)).unwrap())
+        x.iter(|| cbor2::serialized_size(black_box(&blob.value)).unwrap())
     });
     g.finish();
 }
 
-criterion_group!(benches, bench_encode, bench_scan, bench_serialized_size);
+fn scenario(c: &mut Criterion) {
+    let fixtures = Fixtures::prepare();
+    let Fixtures { ints, logs, blob } = &fixtures;
+    encode(c, ints);
+    encode(c, logs);
+    encode(c, blob);
+    scan(c, ints);
+    scan(c, logs);
+    scan(c, blob);
+    bench_serialized_size(c, &fixtures);
+}
+
+criterion_group!(benches, scenario);
 criterion_main!(benches);

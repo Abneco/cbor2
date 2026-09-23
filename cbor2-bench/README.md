@@ -57,7 +57,8 @@ python3 parse_results.py "$run_dir/stdout.log" > "$run_dir/tables.md"
 ```
 
 The parser reports Criterion's time **point estimate** (slope, or mean when
-slope is unavailable), not the sample median. It includes all five targets,
+slope is unavailable), not the sample median, in Criterion's own units
+(including `ps` for sub-nanosecond results). It includes all five targets,
 including `derive`, and ignores unsupported groups without reusing another
 benchmark's identity. Missing measurements appear as `—`.
 
@@ -265,10 +266,11 @@ and includes the `validate_slice` structural-scan column.
 with direct serialization of identical wire bytes. Both regression targets
 are included in the parser output.
 
-Comparison fixtures share an `Encoded` preparation helper. Before timing, it
-checks complete CBOR validity, slice/reader round trips, fixed-buffer output
-against each codec's vector encoding, and cbor2 size calculation. Integer and
-blob groups also assert cross-codec byte equality. Reused/fixed-buffer timings
+Comparison targets share `Fixtures`, which prepares each payload once with an
+`Encoded` helper. Before timing, it checks complete CBOR validity,
+slice/reader round trips, fixed-buffer output against each codec's vector
+encoding, and cbor2 size calculation. Integer and blob groups also assert
+cross-codec byte equality. Reused/fixed-buffer timings
 pass the encoded bytes through `black_box`, not just the output length.
 
 Allocation contracts are exercised by `cargo test -p cbor2 --all-features

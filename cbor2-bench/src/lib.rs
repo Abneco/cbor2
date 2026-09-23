@@ -16,7 +16,9 @@
 //! Data is generated from a tiny deterministic PRNG so every run, and every
 //! crate, sees byte-identical input without pulling in `rand`.
 
+use minicbor::bytes::ByteVec;
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 
 /// SplitMix64 — a deterministic, dependency-free PRNG for fixtures.
 struct SplitMix64(u64);
@@ -299,21 +301,63 @@ impl Encoded {
     }
 }
 
+/// One comparison payload: the serde value, its minicbor view and every
+/// codec's checked encoding.
+pub struct Payload<T, M> {
+    pub name: &'static str,
+    pub value: T,
+    pub mini: M,
+    pub encoded: Encoded,
+}
+
+/// The three comparison payloads shared by every scenario and `sizes`.
+pub struct Fixtures {
+    pub ints: Payload<Vec<u64>, Vec<u64>>,
+    pub logs: Payload<Vec<LogEntry>, Vec<LogEntryMini>>,
+    pub blob: Payload<ByteBuf, ByteVec>,
+}
+
+impl Fixtures {
+    /// Builds and checks the payloads; see [`Encoded::new`].
+    pub fn prepare() -> Self {
+        fn payload<T, M>(name: &'static str, value: T, mini: M) -> Payload<T, M>
+        where
+            T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+            M: minicbor::Encode<()>
+                + for<'b> minicbor::Decode<'b, ()>
+                + PartialEq
+                + std::fmt::Debug,
+        {
+            let encoded = Encoded::new(&value, &mini);
+            Payload {
+                name,
+                value,
+                mini,
+                encoded,
+            }
+        }
+
+        let ints = int_array(INT_ARRAY_LEN);
+        let logs = log_batch(LOG_BATCH_LEN);
+        let logs_mini = log_batch_mini(&logs);
+        let raw = blob(BLOB_LEN);
+        let fixtures = Self {
+            ints: payload("int_array", ints.clone(), ints),
+            logs: payload("log_batch", logs, logs_mini),
+            blob: payload("blob", ByteBuf::from(raw.clone()), ByteVec::from(raw)),
+        };
+        fixtures.ints.encoded.assert_identical();
+        fixtures.blob.encoded.assert_identical();
+        fixtures
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn fixtures_round_trip_and_fixed_buffers_match() {
-        let ints = int_array(INT_ARRAY_LEN);
-        Encoded::new(&ints, &ints).assert_identical();
-        let logs = log_batch(LOG_BATCH_LEN);
-        Encoded::new(&logs, &log_batch_mini(&logs));
-        let raw = blob(BLOB_LEN);
-        Encoded::new(
-            &serde_bytes::ByteBuf::from(raw.clone()),
-            &minicbor::bytes::ByteVec::from(raw),
-        )
-        .assert_identical();
+        Fixtures::prepare();
     }
 }

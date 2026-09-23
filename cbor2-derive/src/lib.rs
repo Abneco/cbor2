@@ -46,11 +46,19 @@ use core::fmt::Write as _;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::ext::IdentExt as _;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned as _;
 use syn::visit_mut::{self, VisitMut};
 
 mod bounds;
+
+// Returns a spanned compile error from the enclosing function or closure.
+macro_rules! bail {
+    ($span:expr, $($message:tt)+) => {
+        return Err(syn::Error::new($span, format!($($message)+)))
+    };
+}
 
 // The marker prefix recognized by the `cbor2` serializers. Keep in sync
 // with `cbor2::ser::STRUCT_MARKER`; the integration tests of the `cbor2`
@@ -83,11 +91,11 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
         .lifetimes()
         .find(|def| def.lifetime.ident == "de")
     {
-        return Err(syn::Error::new(
+        bail!(
             lifetime.lifetime.span(),
             "#[derive(Cbor)] cannot support a lifetime named 'de because serde's \
-             Deserialize derive reserves that name; rename the lifetime",
-        ));
+             Deserialize derive reserves that name; rename the lifetime"
+        );
     }
 
     let container = container_attrs(&input.attrs)?;
@@ -98,33 +106,20 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
         .map(|(_, span)| *span)
         .or(serde.split_rename)
     {
-        return Err(syn::Error::new(
+        bail!(
             span,
             "#[derive(Cbor)] does not support a container-level #[serde(rename = ...)]; \
-             rename the type itself",
-        ));
+             rename the type itself"
+        );
     }
 
     // Parse each field/variant once for validation and impl-bound inference.
-    let groups: Vec<_> = match &input.data {
-        syn::Data::Struct(data) => vec![FieldGroup::new(&data.fields, SerdeAttrs::default())],
-        syn::Data::Enum(data) => data
-            .variants
-            .iter()
-            .map(|variant| FieldGroup::new(&variant.fields, scan_serde(&variant.attrs)))
-            .collect(),
-        syn::Data::Union(data) => {
-            return Err(syn::Error::new(
-                data.union_token.span(),
-                "Cbor supports structs and enums",
-            ))
-        }
-    };
-
+    let groups: Vec<_>;
     let mut entries = Vec::new();
     let mut flatten = false;
     match &input.data {
         syn::Data::Struct(data) => {
+            groups = vec![FieldGroup::new(&data.fields, SerdeAttrs::default())];
             let fields = &groups[0].fields;
             if container.array.is_some()
                 || matches!(&data.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() > 1)
@@ -137,54 +132,54 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
             if let Some(span) = fields_have_flatten(fields) {
                 flatten = true;
                 if !matches!(data.fields, syn::Fields::Named(..)) {
-                    return Err(syn::Error::new(
+                    bail!(
                         span,
-                        "#[serde(flatten)] with #[derive(Cbor)] requires a struct with named fields",
-                    ));
+                        "#[serde(flatten)] with #[derive(Cbor)] requires a struct \
+                         with named fields"
+                    );
                 }
                 if let Some(array) = container.array {
-                    return Err(syn::Error::new(
+                    bail!(
                         array,
-                        "#[serde(flatten)] cannot be used with #[cbor(array)]",
-                    ));
+                        "#[serde(flatten)] cannot be used with #[cbor(array)]"
+                    );
                 }
             }
 
             if let Some(span) = container.array {
                 if !matches!(data.fields, syn::Fields::Named(..)) {
-                    return Err(syn::Error::new(
-                        span,
-                        "#[cbor(array)] requires a struct with named fields",
-                    ));
+                    bail!(span, "#[cbor(array)] requires a struct with named fields");
                 }
                 if let Some(entry) = entries.first() {
-                    return Err(syn::Error::new(
+                    bail!(
                         entry.span,
-                        "#[cbor(key = ...)] cannot be used with #[cbor(array)]",
-                    ));
+                        "#[cbor(key = ...)] cannot be used with #[cbor(array)]"
+                    );
                 }
             }
 
             if !entries.is_empty() {
                 if let Some(span) = serde.rename_all {
-                    return Err(syn::Error::new(
+                    bail!(
                         span,
                         "#[serde(rename_all = ...)] is not supported with \
-                         #[cbor(key = ...)]; rename the fields explicitly",
-                    ));
+                         #[cbor(key = ...)]; rename the fields explicitly"
+                    );
                 }
             }
         }
 
         syn::Data::Enum(data) => {
+            groups = data
+                .variants
+                .iter()
+                .map(|variant| FieldGroup::new(&variant.fields, scan_serde(&variant.attrs)))
+                .collect();
             if let Some(tag) = &container.tag {
-                return Err(syn::Error::new(
-                    tag.span,
-                    "`tag = ...` is not supported on enums",
-                ));
+                bail!(tag.span, "`tag = ...` is not supported on enums");
             }
             if let Some(span) = container.array {
-                return Err(syn::Error::new(span, "`array` is not supported on enums"));
+                bail!(span, "`array` is not supported on enums");
             }
 
             for (variant, group) in data.variants.iter().zip(&groups) {
@@ -193,26 +188,26 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
                     validate_positional_fields(&group.fields)?;
                 }
                 if let Some(attr) = variant.attrs.iter().find(|a| a.path().is_ident("cbor")) {
-                    return Err(syn::Error::new(
+                    bail!(
                         attr.span(),
-                        "#[cbor(...)] is not supported on enum variants",
-                    ));
+                        "#[cbor(...)] is not supported on enum variants"
+                    );
                 }
 
                 let keyed = field_entries(&group.fields)?;
                 if let Some(span) = fields_have_flatten(&group.fields) {
-                    return Err(syn::Error::new(
+                    bail!(
                         span,
-                        "#[serde(flatten)] with #[derive(Cbor)] is supported only on structs",
-                    ));
+                        "#[serde(flatten)] with #[derive(Cbor)] is supported only on structs"
+                    );
                 }
                 if !keyed.is_empty() {
                     if let Some(span) = group.attrs.rename_all {
-                        return Err(syn::Error::new(
+                        bail!(
                             span,
                             "#[serde(rename_all = ...)] is not supported with \
-                             #[cbor(key = ...)]; rename the fields explicitly",
-                        ));
+                             #[cbor(key = ...)]; rename the fields explicitly"
+                        );
                     }
                 }
                 for entry in keyed {
@@ -223,30 +218,32 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
             if !entries.is_empty() {
                 for group in &groups {
                     if let Some(span) = group.attrs.enum_repr {
-                        return Err(syn::Error::new(
+                        bail!(
                             span,
-                            "untagged variants are not supported in enums with #[cbor(key = ...)]",
-                        ));
+                            "untagged variants are not supported in enums with #[cbor(key = ...)]"
+                        );
                     }
                 }
                 validate_enum_keys(&groups, &entries)?;
                 if let Some(span) = serde.rename_all_fields {
-                    return Err(syn::Error::new(
+                    bail!(
                         span,
                         "#[serde(rename_all_fields = ...)] is not supported with \
-                         #[cbor(key = ...)]; rename the fields explicitly",
-                    ));
+                         #[cbor(key = ...)]; rename the fields explicitly"
+                    );
                 }
                 if let Some(span) = serde.enum_repr {
-                    return Err(syn::Error::new(
+                    bail!(
                         span,
-                        "only externally tagged enums support #[cbor(key = ...)]",
-                    ));
+                        "only externally tagged enums support #[cbor(key = ...)]"
+                    );
                 }
             }
         }
 
-        syn::Data::Union(..) => unreachable!("rejected above"),
+        syn::Data::Union(data) => {
+            bail!(data.union_token.span(), "Cbor supports structs and enums")
+        }
     }
 
     // These container shapes make serde bypass the container name — and
@@ -255,37 +252,40 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
     if container.tag.is_some() || container.array.is_some() || !entries.is_empty() {
         if matches!(input.data, syn::Data::Struct(..)) {
             if let Some(span) = serde.tag {
-                return Err(syn::Error::new(span,
-                    "#[serde(tag = ...)] on a struct conflicts with #[cbor(...)] keys, tags or array shape"));
+                bail!(
+                    span,
+                    "#[serde(tag = ...)] on a struct conflicts with #[cbor(...)] keys, \
+                     tags or array shape"
+                );
             }
         }
         if let Some(span) = serde.transparent {
-            return Err(syn::Error::new(
+            bail!(
                 span,
                 "#[serde(transparent)] bypasses the container, so the declared \
-                 #[cbor(...)] tag, array shape or keys would be silently ignored",
-            ));
+                 #[cbor(...)] tag, array shape or keys would be silently ignored"
+            );
         }
         if let Some(span) = serde.into {
-            return Err(syn::Error::new(
+            bail!(
                 span,
                 "#[serde(into = ...)] serializes through another type, so the declared \
-                 #[cbor(...)] tag, array shape or keys would be silently ignored on encode",
-            ));
+                 #[cbor(...)] tag, array shape or keys would be silently ignored on encode"
+            );
         }
         if let Some(span) = serde.from {
-            return Err(syn::Error::new(
+            bail!(
                 span,
                 "#[serde(from = ...)] deserializes through another type, so the declared \
-                 #[cbor(...)] tag, array shape or keys would be silently ignored on decode",
-            ));
+                 #[cbor(...)] tag, array shape or keys would be silently ignored on decode"
+            );
         }
         if let Some(span) = serde.try_from {
-            return Err(syn::Error::new(
+            bail!(
                 span,
                 "#[serde(try_from = ...)] deserializes through another type, so the declared \
-                 #[cbor(...)] tag, array shape or keys would be silently ignored on decode",
-            ));
+                 #[cbor(...)] tag, array shape or keys would be silently ignored on decode"
+            );
         }
     }
 
@@ -301,63 +301,43 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
 // type's name and field names stay exactly as written.
 fn prepare_shadow(
     input: &syn::DeriveInput,
-    container: &ContainerAttrs,
-    entries: &[Entry],
+    shadow_ident: &syn::Ident,
+    name: &str,
     serde: &SerdeAttrs,
     de_generics: &syn::Generics,
     de_lifetime: &syn::Lifetime,
 ) -> syn::DeriveInput {
-    let tag = container.tag.as_ref().map(|tag| tag.value);
-    let array = container.array.is_some();
     let ident = &input.ident;
-    let shadow_ident = format_ident!("__CborShadow");
+    let (_, ty_generics, _) = input.generics.split_for_impl();
+    let original: syn::Path = syn::parse_quote!(#ident #ty_generics);
 
     let mut shadow = input.clone();
     shadow.ident = shadow_ident.clone();
-    let (_, original_args, _) = input.generics.split_for_impl();
-    let original: syn::Path = syn::parse_quote!(#ident #original_args);
-    shadow.attrs = copied_attrs(&input.attrs);
-    match &mut shadow.data {
-        syn::Data::Struct(data) => {
-            for field in data.fields.iter_mut() {
-                field.attrs = copied_attrs(&field.attrs);
-            }
-        }
-        syn::Data::Enum(data) => {
-            for variant in data.variants.iter_mut() {
-                variant.attrs = copied_attrs(&variant.attrs);
-                for field in variant.fields.iter_mut() {
-                    field.attrs = copied_attrs(&field.attrs);
-                }
-            }
-        }
-        syn::Data::Union(..) => unreachable!("rejected above"),
-    }
-
-    let (_, ty_generics, _) = input.generics.split_for_impl();
+    CopiedAttrs.visit_data_mut(&mut shadow.data);
 
     // The remote path: the real type, as seen from inside the const
     // block. serde applies the shadow's own generics to it, so the path
     // itself must not carry generic arguments.
     let remote = ident.to_string();
 
-    let mut head = vec![
+    shadow.attrs = vec![
         syn::parse_quote!(#[derive(::cbor2::__serde::Serialize, ::cbor2::__serde::Deserialize)]),
         syn::parse_quote!(#[serde(remote = #remote)]),
         syn::parse_quote!(#[automatically_derived]),
+        syn::parse_quote!(#[serde(rename = #name)]),
     ];
-    let name = marker(tag, array, entries, ident).unwrap_or_else(|| {
-        let name = ident.to_string();
-        name.strip_prefix("r#").unwrap_or(&name).to_owned()
-    });
-    head.push(syn::parse_quote!(#[serde(rename = #name)]));
     if !serde.explicit_crate {
-        head.push(syn::parse_quote!(#[serde(crate = "::cbor2::__serde")]));
+        shadow
+            .attrs
+            .push(syn::parse_quote!(#[serde(crate = "::cbor2::__serde")]));
     }
-    head.append(&mut shadow.attrs);
-    shadow.attrs = head;
+    shadow.attrs.extend(copied_attrs(&input.attrs));
     ReplaceSelf { original }.visit_derive_input_mut(&mut shadow);
+
     if serde.default {
+        // The remote visitor constructs the original type: point a bare
+        // `default` at its Default impl, and express that bound directly
+        // instead of serde's inferred shadow bound.
         let mut path: syn::Path = syn::parse_quote!(#ident #ty_generics);
         if let syn::PathArguments::AngleBracketed(args) =
             &mut path.segments.last_mut().unwrap().arguments
@@ -366,28 +346,19 @@ fn prepare_shadow(
         }
         path.segments.push(syn::parse_quote!(default));
         let path = quote!(#path).to_string();
-        for attr in &mut shadow.attrs {
-            if !attr.path().is_ident("serde") {
-                continue;
-            }
-            if let Ok(mut metas) = attr.parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            ) {
-                for meta in &mut metas {
-                    if matches!(meta, syn::Meta::Path(p) if p.is_ident("default")) {
-                        *meta = syn::parse_quote!(default = #path);
+        edit_serde_metas(&mut shadow.attrs, |metas| {
+            *metas = std::mem::take(metas)
+                .into_iter()
+                .filter(|meta| !meta.path().is_ident("bound"))
+                .map(|meta| match meta {
+                    syn::Meta::Path(p) if p.is_ident("default") => {
+                        syn::parse_quote!(default = #path)
                     }
-                }
-                if let syn::Meta::List(list) = &mut attr.meta {
-                    list.tokens = quote!(#metas);
-                }
-            }
-        }
-    }
+                    meta => meta,
+                })
+                .collect();
+        });
 
-    if serde.default {
-        // The remote visitor constructs the original type. Express its
-        // Default bound directly instead of serde's inferred shadow bound.
         let mut predicates = de_generics
             .where_clause
             .as_ref()
@@ -403,22 +374,6 @@ fn prepare_shadow(
         let serde_de_lifetime = syn::Lifetime::new("'de", proc_macro2::Span::call_site());
         bounds::rename(&mut predicates, de_lifetime, &serde_de_lifetime);
         let de_text = quote!(#predicates).to_string();
-        for attr in &mut shadow.attrs {
-            if !attr.path().is_ident("serde") {
-                continue;
-            }
-            if let Ok(metas) = attr.parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            ) {
-                let kept: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]> = metas
-                    .into_iter()
-                    .filter(|m| !m.path().is_ident("bound"))
-                    .collect();
-                if let syn::Meta::List(list) = &mut attr.meta {
-                    list.tokens = quote!(#kept);
-                }
-            }
-        }
         if let Some(ser_bound) = &serde.ser_bound {
             let ser_text = quote!(#ser_bound).to_string();
             shadow.attrs.push(
@@ -445,9 +400,18 @@ fn generate(
     let tag = container.tag.as_ref().map(|tag| tag.value);
     let array = container.array.is_some();
     let ident = &input.ident;
+    let type_name = ident.unraw().to_string();
+    let name = marker(tag, array, entries, &type_name).unwrap_or(type_name);
     let shadow_ident = format_ident!("__CborShadow");
     let (ser_generics, de_generics, de_lifetime) = bounds::build(input, serde, groups);
-    let shadow = prepare_shadow(input, container, entries, serde, &de_generics, &de_lifetime);
+    let shadow = prepare_shadow(
+        input,
+        &shadow_ident,
+        &name,
+        serde,
+        &de_generics,
+        &de_lifetime,
+    );
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let (ser_impl_generics, _, ser_where_clause) = ser_generics.split_for_impl();
     let (de_impl_generics, _, de_where_clause) = de_generics.split_for_impl();
@@ -565,7 +529,6 @@ fn generate(
         Some(tag) => quote!(::core::option::Option::Some(#tag)),
         None => quote!(::core::option::Option::None),
     };
-    let array_const = array;
 
     quote! {
         #[doc(hidden)]
@@ -577,7 +540,7 @@ fn generate(
             impl #impl_generics ::cbor2::Cbor for #ident #ty_generics #where_clause {
                 const KEYS: &'static [(&'static str, i128)] = &[#(#key_pairs),*];
                 const TAG: ::core::option::Option<u64> = #tag_const;
-                const ARRAY: bool = #array_const;
+                const ARRAY: bool = #array;
             }
         };
     }
@@ -588,7 +551,11 @@ fn validate_positional_fields(fields: &[FieldInfo<'_>]) -> syn::Result<()> {
         let attrs = &field.attrs;
         if attrs.skip.is_none() {
             if let Some(span) = attrs.positional_skip {
-                return Err(syn::Error::new(span, "conditional or one-directional skipping changes CBOR array field positions; use an Option placeholder or #[serde(skip)]"));
+                bail!(
+                    span,
+                    "conditional or one-directional skipping changes CBOR array \
+                     field positions; use an Option placeholder or #[serde(skip)]"
+                );
             }
         }
     }
@@ -615,50 +582,75 @@ impl VisitMut for ReplaceSelf {
         }
         visit_mut::visit_path_mut(self, path);
     }
+    // Serde attributes name functions and paths in strings.
     fn visit_attribute_mut(&mut self, attr: &mut syn::Attribute) {
-        if attr.path().is_ident("serde") {
-            if let Ok(mut metas) = attr.parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            ) {
-                for meta in &mut metas {
-                    if let syn::Meta::NameValue(meta) = meta {
-                        if [
-                            "default",
-                            "with",
-                            "serialize_with",
-                            "deserialize_with",
-                            "skip_serializing_if",
-                        ]
-                        .iter()
-                        .any(|name| meta.path.is_ident(name))
-                        {
-                            if let syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(lit),
-                                ..
-                            }) = &mut meta.value
-                            {
-                                if let Ok(mut path) = lit.parse::<syn::Path>() {
-                                    self.visit_path_mut(&mut path);
-                                    *lit = syn::LitStr::new(&quote!(#path).to_string(), lit.span());
-                                }
-                            }
-                        }
+        edit_serde_metas([attr], |metas| {
+            for meta in metas {
+                let syn::Meta::NameValue(meta) = meta else {
+                    continue;
+                };
+                let names = [
+                    "default",
+                    "with",
+                    "serialize_with",
+                    "deserialize_with",
+                    "skip_serializing_if",
+                ];
+                if !names.iter().any(|name| meta.path.is_ident(name)) {
+                    continue;
+                }
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(lit),
+                    ..
+                }) = &mut meta.value
+                {
+                    if let Ok(mut path) = lit.parse::<syn::Path>() {
+                        self.visit_path_mut(&mut path);
+                        *lit = syn::LitStr::new(&quote!(#path).to_string(), lit.span());
                     }
                 }
-                if let syn::Meta::List(list) = &mut attr.meta {
-                    list.tokens = quote!(#metas);
-                }
+            }
+        });
+    }
+}
+
+// Keeps only the carried-over attributes on the shadow's variants and fields.
+struct CopiedAttrs;
+
+impl VisitMut for CopiedAttrs {
+    fn visit_variant_mut(&mut self, variant: &mut syn::Variant) {
+        variant.attrs = copied_attrs(&variant.attrs);
+        visit_mut::visit_variant_mut(self, variant);
+    }
+
+    fn visit_field_mut(&mut self, field: &mut syn::Field) {
+        field.attrs = copied_attrs(&field.attrs);
+    }
+}
+
+type Metas = syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>;
+
+// Rewrites the metas of each `#[serde(...)]` attribute that parses as a meta
+// list; serde's own derive reports anything else.
+fn edit_serde_metas<'a>(
+    attrs: impl IntoIterator<Item = &'a mut syn::Attribute>,
+    mut edit: impl FnMut(&mut Metas),
+) {
+    for attr in attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        if let Ok(mut metas) = attr.parse_args_with(Metas::parse_terminated) {
+            edit(&mut metas);
+            if let syn::Meta::List(list) = &mut attr.meta {
+                list.tokens = quote!(#metas);
             }
         }
     }
 }
 
-// Picks an internal deserializer lifetime that cannot collide with the
-// user's generics (including a user lifetime named `'__de`).
-fn fresh_de_lifetime(generics: &syn::Generics) -> syn::Lifetime {
-    fresh_lifetime(generics, "__de")
-}
-
+// Picks an internal lifetime such as the deserializer's `'__de` that cannot
+// collide with the user's generics (including a user lifetime of that name).
 fn fresh_lifetime(generics: &syn::Generics, base: &str) -> syn::Lifetime {
     let mut name = String::from(base);
     while generics.lifetimes().any(|def| def.lifetime.ident == name) {
@@ -690,7 +682,7 @@ fn copied_attrs(attrs: &[syn::Attribute]) -> Vec<syn::Attribute> {
 
 // The `@@CBOR@@<tag>@@<keys>@@<name>` container marker, when the item
 // declares a tag, array shape or integer keys.
-fn marker(tag: Option<u64>, array: bool, entries: &[Entry], ident: &syn::Ident) -> Option<String> {
+fn marker(tag: Option<u64>, array: bool, entries: &[Entry], name: &str) -> Option<String> {
     if tag.is_none() && entries.is_empty() && !array {
         return None;
     }
@@ -710,8 +702,7 @@ fn marker(tag: Option<u64>, array: bool, entries: &[Entry], ident: &syn::Ident) 
     if array {
         marker.push_str("array@@");
     }
-    let name = ident.to_string();
-    marker.push_str(name.strip_prefix("r#").unwrap_or(&name));
+    marker.push_str(name);
 
     Some(marker)
 }
@@ -730,40 +721,57 @@ struct KeyArg {
 
 impl Parse for KeyArg {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        const RANGE: &str = "#[cbor(key = ...)] must fit a CBOR integer (-2^64 ..= 2^64 - 1)";
-
         let name: syn::Ident = input.parse()?;
         if name != "key" {
-            return Err(syn::Error::new(name.span(), "expected `key = <integer>`"));
+            bail!(name.span(), "expected `key = <integer>`");
         }
         input.parse::<syn::Token![=]>()?;
 
-        let negative = input.peek(syn::Token![-]);
-        if negative {
-            input.parse::<syn::Token![-]>()?;
-        }
-        let literal: syn::LitInt = input.parse()?;
+        // CBOR integer keys span major types 0 and 1.
+        let (value, span) = int_arg(
+            input,
+            "key",
+            -(u64::MAX as i128) - 1,
+            "#[cbor(key = ...)] must fit a CBOR integer (-2^64 ..= 2^64 - 1)",
+        )?;
+        Ok(KeyArg { value, span })
+    }
+}
 
-        // `base10_parse` ignores a type suffix; a suffixed key would be
-        // accepted with the suffix silently meaning nothing.
-        if !literal.suffix().is_empty() {
-            return Err(syn::Error::new(
-                literal.span(),
-                "#[cbor(key = ...)] does not accept a suffixed integer literal",
-            ));
-        }
+// Parses the unsuffixed integer literal of `#[cbor(<name> = ...)]`, which
+// must lie in `min ..= 2^64 - 1`; anything else reports `range`.
+fn int_arg(
+    input: ParseStream<'_>,
+    name: &str,
+    min: i128,
+    range: &str,
+) -> syn::Result<(i128, proc_macro2::Span)> {
+    let minus: Option<syn::Token![-]> = input.parse()?;
+    let literal: syn::LitInt = input.parse()?;
+    let span = literal.span();
 
-        // A `LitInt` is already a valid integer, so the only parse failure
-        // left is overflow; report it as the CBOR range.
-        let magnitude: i128 = literal
-            .base10_parse()
-            .map_err(|_| syn::Error::new(literal.span(), RANGE))?;
-        let value = if negative { -magnitude } else { magnitude };
+    // `base10_parse` ignores a type suffix; a suffixed value would be
+    // accepted with the suffix silently meaning nothing.
+    if !literal.suffix().is_empty() {
+        bail!(
+            span,
+            "#[cbor({name} = ...)] does not accept a suffixed integer literal"
+        );
+    }
 
-        Ok(KeyArg {
-            value,
-            span: literal.span(),
-        })
+    // A `LitInt` is already a valid integer, so the only failure left is
+    // the range, including overflow beyond i128.
+    let value = literal
+        .base10_parse::<i128>()
+        .ok()
+        .and_then(|value| match minus {
+            None => Some(value),
+            Some(_) if min < 0 => Some(-value),
+            Some(_) => None,
+        });
+    match value {
+        Some(value) if (min..=u64::MAX as i128).contains(&value) => Ok((value, span)),
+        _ => bail!(span, "{range}"),
     }
 }
 
@@ -786,50 +794,30 @@ fn container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerAttrs> {
 
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("tag") {
-                const RANGE: &str = "tag must fit a CBOR tag (0 ..= 2^64 - 1)";
-                let value = meta.value()?;
-                if value.peek(syn::Token![-]) {
-                    return Err(syn::Error::new(value.span(), RANGE));
-                }
-                let literal: syn::LitInt = value.parse()?;
-                if !literal.suffix().is_empty() {
-                    return Err(syn::Error::new(
-                        literal.span(),
-                        "#[cbor(tag = ...)] does not accept a suffixed integer literal",
-                    ));
-                }
+                let (value, span) = int_arg(
+                    meta.value()?,
+                    "tag",
+                    0,
+                    "tag must fit a CBOR tag (0 ..= 2^64 - 1)",
+                )?;
                 let tag = TagArg {
-                    value: literal
-                        .base10_parse()
-                        .map_err(|_| syn::Error::new(literal.span(), RANGE))?,
-                    span: literal.span(),
+                    value: value as u64,
+                    span,
                 };
                 if out.tag.replace(tag).is_some() {
-                    return Err(syn::Error::new(
-                        meta.path.span(),
-                        "duplicate #[cbor(tag = ...)] attribute",
-                    ));
+                    bail!(meta.path.span(), "duplicate #[cbor(tag = ...)] attribute");
                 }
                 Ok(())
             } else if meta.path.is_ident("array") {
                 if meta.input.peek(syn::Token![=]) {
-                    return Err(syn::Error::new(
-                        meta.path.span(),
-                        "expected `array` without a value",
-                    ));
+                    bail!(meta.path.span(), "expected `array` without a value");
                 }
                 if out.array.replace(meta.path.span()).is_some() {
-                    return Err(syn::Error::new(
-                        meta.path.span(),
-                        "duplicate #[cbor(array)] attribute",
-                    ));
+                    bail!(meta.path.span(), "duplicate #[cbor(array)] attribute");
                 }
                 Ok(())
             } else {
-                Err(syn::Error::new(
-                    meta.path.span(),
-                    "expected `tag = <integer>` or `array`",
-                ))
+                bail!(meta.path.span(), "expected `tag = <integer>` or `array`");
             }
         })?;
     }
@@ -851,23 +839,23 @@ fn merge_entry(entries: &mut Vec<Entry>, entry: Entry) -> syn::Result<()> {
         .iter()
         .find(|e| e.name == entry.name || e.key == entry.key)
     {
-        Some(e) if e.name == entry.name && e.key == entry.key => Ok(()),
-        Some(e) if e.name == entry.name => Err(syn::Error::new(
+        Some(e) if e.name == entry.name && e.key == entry.key => {}
+        Some(e) if e.name == entry.name => bail!(
             entry.span,
-            format!(
-                "field `{}` maps to conflicting keys {} and {}",
-                entry.name, e.key, entry.key
-            ),
-        )),
-        Some(e) => Err(syn::Error::new(
+            "field `{}` maps to conflicting keys {} and {}",
+            entry.name,
+            e.key,
+            entry.key
+        ),
+        Some(e) => bail!(
             entry.span,
-            format!("key {} is already mapped to field `{}`", entry.key, e.name),
-        )),
-        None => {
-            entries.push(entry);
-            Ok(())
-        }
+            "key {} is already mapped to field `{}`",
+            entry.key,
+            e.name
+        ),
+        None => entries.push(entry),
     }
+    Ok(())
 }
 
 // A marker's key table is shared by every variant. Reject unkeyed fields
@@ -896,8 +884,6 @@ fn validate_enum_keys(groups: &[FieldGroup<'_>], entries: &[Entry]) -> syn::Resu
                 if skipped {
                     continue;
                 }
-                let ident = ident.to_string();
-                let name = ident.strip_prefix("r#").unwrap_or(&ident);
                 let name = info
                     .attrs
                     .rename
@@ -905,12 +891,16 @@ fn validate_enum_keys(groups: &[FieldGroup<'_>], entries: &[Entry]) -> syn::Resu
                     .map(|(name, _)| name.clone())
                     .or_else(|| info.attrs.split_names[side].clone())
                     .unwrap_or_else(|| {
-                        rename_field(name, group.attrs.rename_rules[side].as_deref())
+                        let rule = group.attrs.rename_rules[side].as_deref();
+                        rename_field(&ident.unraw().to_string(), rule)
                     });
                 if let Some(entry) = entries.iter().find(|entry| entry.name == name) {
-                    return Err(syn::Error::new(info.field.span(), format!(
-                        "field `{name}` must declare #[cbor(key = {})] consistently across enum variants", entry.key
-                    )));
+                    bail!(
+                        info.field.span(),
+                        "field `{name}` must declare #[cbor(key = {})] consistently \
+                         across enum variants",
+                        entry.key
+                    );
                 }
             }
         }
@@ -963,71 +953,59 @@ fn field_entries(fields: &[FieldInfo<'_>]) -> syn::Result<Vec<Entry>> {
 
             let arg: KeyArg = attr.parse_args()?;
             if key.replace(arg).is_some() {
-                return Err(syn::Error::new(
-                    attr.span(),
-                    "duplicate #[cbor(key = ...)] attribute",
-                ));
+                bail!(attr.span(), "duplicate #[cbor(key = ...)] attribute");
             }
         }
         let serde = &info.attrs;
         if let (Some(..), Some(span)) = (&key, serde.flatten) {
-            return Err(syn::Error::new(
+            bail!(
                 span,
-                "#[serde(flatten)] cannot be combined with #[cbor(key = ...)]",
-            ));
+                "#[serde(flatten)] cannot be combined with #[cbor(key = ...)]"
+            );
         }
         // A fully skipped field is never on the wire in either direction,
         // so a key on it is a mistake. (The one-directional
         // `skip_serializing`/`skip_deserializing` variants keep the key
         // meaningful and stay allowed.)
         if let (Some(..), Some(span)) = (&key, serde.skip) {
-            return Err(syn::Error::new(
+            bail!(
                 span,
                 "#[serde(skip)] cannot be combined with #[cbor(key = ...)]; \
-                 the field is never on the wire",
-            ));
+                 the field is never on the wire"
+            );
         }
 
         let Some(key) = key else { continue };
 
         if field.ident.is_none() {
-            return Err(syn::Error::new(
-                key.span,
-                "#[cbor(key = ...)] requires a named field",
-            ));
-        }
-
-        // CBOR integer keys span major types 0 and 1.
-        if key.value > u64::MAX as i128 || key.value < -(u64::MAX as i128) - 1 {
-            return Err(syn::Error::new(
-                key.span,
-                "#[cbor(key = ...)] must fit a CBOR integer (-2^64 ..= 2^64 - 1)",
-            ));
+            bail!(key.span, "#[cbor(key = ...)] requires a named field");
         }
 
         if let Some(span) = serde.split_rename {
-            return Err(syn::Error::new(
+            bail!(
                 span,
                 "split serialize/deserialize renames are not supported with \
-                 #[cbor(key = ...)]",
-            ));
+                 #[cbor(key = ...)]"
+            );
         }
 
         // The key table is consulted with the field's *serde* name, so an
         // explicit rename carries over.
         let name = match &serde.rename {
             Some((name, _)) => name.clone(),
-            None => {
-                let ident = field.ident.as_ref().expect("checked above").to_string();
-                ident.strip_prefix("r#").unwrap_or(&ident).to_string()
-            }
+            None => field
+                .ident
+                .as_ref()
+                .expect("checked above")
+                .unraw()
+                .to_string(),
         };
 
         if name.is_empty() || name.contains(['@', ';', '=']) {
-            return Err(syn::Error::new(
+            bail!(
                 key.span,
-                "the serde name of a keyed field may not be empty or contain '@', ';' or '='",
-            ));
+                "the serde name of a keyed field may not be empty or contain '@', ';' or '='"
+            );
         }
 
         entries.push(Entry {

@@ -167,17 +167,20 @@ JSON conversion is best-effort where CBOR is richer: byte strings become
 lowercase hex strings, non-string map keys are JSON-encoded into strings,
 non-finite floats and `undefined` become `null`, integers beyond the
 64-bit ranges become strings, and tags are dropped (keeping the inner
-value). If multiple CBOR keys become the same JSON object key (including
-duplicate text keys), conversion fails with status 1 instead of overwriting
-a value. The failing item is not written; preceding sequence items may already
-have been output. Complete JSON items are flushed before reading the next item.
+value). Object members keep the CBOR map order. If multiple CBOR keys become
+the same JSON object key (including duplicate text keys), conversion fails
+with status 1 instead of overwriting a value. The failing item is not written;
+preceding sequence items may already have been output. Output is buffered,
+and complete items are flushed before the command waits for more input.
 
 ## encode
 
 `cbor encode` reads JSON-compatible values or Concise Diagnostic Notation
 (from a file or stdin) and writes each value as a CBOR item. Add `--json` to
-accept only JSON text, or `--diag`/`--cdn` to accept only CDN text. Add `--hex`
-for copyable lowercase hex text:
+accept only JSON text, or `--diag`/`--cdn` to accept only CDN text. Both
+parsers keep map entries in input order, including duplicate keys, so the
+same JSON text encodes to the same bytes either way. Add `--hex` for copyable
+lowercase hex text:
 
 ```bash
 $ echo '{"name": "example", "ok": true}' | cbor encode | cbor

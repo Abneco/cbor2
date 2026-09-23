@@ -18,7 +18,11 @@
 //! cargo install cbor2-cli              # installs cbor
 //! ```
 
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::env;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
@@ -76,50 +80,28 @@ enum Command {
     Validate,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DecodeOutput {
-    Diag,
-    Json,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EncodeOutput {
-    Raw,
-    Hex,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EncodeInput {
-    Json,
-    Cdn,
-}
-
 struct Args {
     command: Command,
-    decode_output: DecodeOutput,
-    encode_output: EncodeOutput,
-    encode_input: EncodeInput,
+    // `--json`: JSON output for `decode`, JSON-only input for `encode`.
+    json: bool,
+    // `--hex`: copyable hex output for `encode`.
+    hex: bool,
     input: Option<String>,
 }
 
 fn main() {
     let Args {
         command,
-        decode_output,
-        encode_output,
-        encode_input,
+        json,
+        hex,
         input,
     } = parse_args();
+    let input = input.as_deref();
 
     let result = match command {
-        Command::Show => decode(open_cbor_input(input.as_deref()), DecodeOutput::Diag),
-        Command::Decode => decode(open_cbor_input(input.as_deref()), decode_output),
-        Command::Encode => encode(
-            open_text_input(input.as_deref()),
-            encode_output,
-            encode_input,
-        ),
-        Command::Validate => validate(open_cbor_input(input.as_deref())),
+        Command::Show | Command::Decode => decode(open_cbor_input(input), json),
+        Command::Encode => encode(open_text_input(input), json, hex),
+        Command::Validate => validate(open_cbor_input(input)),
     };
 
     if let Err(err) = result {
@@ -137,7 +119,7 @@ fn parse_args() -> Args {
     let mut diag = false;
     let mut cdn = false;
     let mut json = false;
-    let mut encode_output = EncodeOutput::Raw;
+    let mut hex = false;
     let mut positional = Vec::new();
     let mut input_only = false;
 
@@ -160,7 +142,7 @@ fn parse_args() -> Args {
             "-d" | "--diag" => diag = true,
             "--cdn" => cdn = true,
             "--json" => json = true,
-            "--hex" => encode_output = EncodeOutput::Hex,
+            "--hex" => hex = true,
             _ if arg.starts_with('-') && arg != "-" => {
                 usage_error(format_args!("unrecognized option `{arg}`"));
             }
@@ -193,45 +175,27 @@ fn parse_args() -> Args {
     if positional.next().is_some() {
         usage_error(format_args!("at most one INPUT argument"));
     }
-    if json && !matches!(command, Command::Decode | Command::Encode) {
-        usage_error(format_args!(
-            "`--json` only applies to `decode` or `encode`"
-        ));
-    }
-    if diag && !matches!(command, Command::Decode | Command::Encode) {
-        usage_error(format_args!(
-            "`--diag` only applies to `decode` or `encode`"
-        ));
-    }
-    if cdn && !matches!(command, Command::Decode | Command::Encode) {
-        usage_error(format_args!("`--cdn` only applies to `decode` or `encode`"));
+    let codec = matches!(command, Command::Decode | Command::Encode);
+    for (set, flag) in [(json, "--json"), (diag, "--diag"), (cdn, "--cdn")] {
+        if set && !codec {
+            usage_error(format_args!(
+                "`{flag}` only applies to `decode` or `encode`"
+            ));
+        }
     }
     if json && (diag || cdn) {
         usage_error(format_args!(
             "`--json` cannot be combined with `--diag` or `--cdn`"
         ));
     }
-    if encode_output == EncodeOutput::Hex && !matches!(command, Command::Encode) {
+    if hex && !matches!(command, Command::Encode) {
         usage_error(format_args!("`--hex` only applies to `encode`"));
     }
 
-    let decode_output = if json {
-        DecodeOutput::Json
-    } else {
-        DecodeOutput::Diag
-    };
-
-    let encode_input = if json {
-        EncodeInput::Json
-    } else {
-        EncodeInput::Cdn
-    };
-
     Args {
         command,
-        decode_output,
-        encode_output,
-        encode_input,
+        json,
+        hex,
         input,
     }
 }
@@ -243,18 +207,16 @@ fn usage_error(msg: core::fmt::Arguments<'_>) -> ! {
 }
 
 // Opens the input of the CBOR-reading commands: stdin (absent or `-`),
-// an existing file, a hex string or a base64/base64url string.
+// an existing file, a hex string or a base64/base64url string. Commands add
+// their own buffering.
 fn open_cbor_input(arg: Option<&str>) -> Box<dyn Read> {
     let arg = match arg {
-        None | Some("-") => return Box::new(BufReader::new(io::stdin().lock())),
+        None | Some("-") => return Box::new(io::stdin().lock()),
         Some(arg) => arg,
     };
 
     if Path::new(arg).exists() {
-        match File::open(arg) {
-            Ok(file) => return Box::new(BufReader::new(file)),
-            Err(err) => usage_error(format_args!("{arg}: {err}")),
-        }
+        return open_file(arg);
     }
 
     // Anything with a path separator is always a path — `/` is also a
@@ -280,18 +242,28 @@ fn open_cbor_input(arg: Option<&str>) -> Box<dyn Read> {
 // Opens the input of `encode`: stdin (absent or `-`) or a text file.
 fn open_text_input(arg: Option<&str>) -> Box<dyn Read> {
     match arg {
-        None | Some("-") => Box::new(BufReader::new(io::stdin().lock())),
-        Some(path) => match File::open(path) {
-            Ok(file) => Box::new(BufReader::new(file)),
-            Err(err) => usage_error(format_args!("{path}: {err}")),
-        },
+        None | Some("-") => Box::new(io::stdin().lock()),
+        Some(path) => open_file(path),
+    }
+}
+
+// A directory opens on some platforms but cannot be read; like any other
+// unreadable input it is a usage error.
+fn open_file(path: &str) -> Box<dyn Read> {
+    match File::open(path) {
+        Ok(file) if file.metadata().is_ok_and(|meta| meta.is_dir()) => {
+            usage_error(format_args!("{path}: is a directory"))
+        }
+        Ok(file) => Box::new(file),
+        Err(err) => usage_error(format_args!("{path}: {err}")),
     }
 }
 
 type Error = Box<dyn std::error::Error>;
 
-// These serializers wrap output errors instead of always exposing io::Error
-// through Error::source. A consumer such as `head` may close stdout early.
+// A consumer such as `head` may close stdout early. Buffered output is also
+// flushed before reading more input, so the error can arrive wrapped as an
+// input error of the CBOR or JSON deserializer.
 fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(error) = error.downcast_ref::<io::Error>() {
         return error.kind() == io::ErrorKind::BrokenPipe;
@@ -299,43 +271,66 @@ fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(error) = error.downcast_ref::<serde_json::Error>() {
         return error.io_error_kind() == Some(io::ErrorKind::BrokenPipe);
     }
-    matches!(error.downcast_ref::<cbor2::ser::Error>(),
-        Some(cbor2::ser::Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+    matches!(error.downcast_ref::<cbor2::de::Error>(),
+        Some(cbor2::de::Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+}
+
+type Output = RefCell<BufWriter<io::StdoutLock<'static>>>;
+
+fn output() -> Output {
+    RefCell::new(BufWriter::new(io::stdout().lock()))
+}
+
+// Flushes the buffered output before each read of the underlying input.
+// Complete items become visible before a command may wait for more input,
+// without one write per item.
+struct FlushBeforeRead<'a> {
+    input: Box<dyn Read>,
+    output: &'a Output,
+}
+
+impl Read for FlushBeforeRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.output.borrow_mut().flush()?;
+        self.input.read(buf)
+    }
+}
+
+fn streaming(input: Box<dyn Read>, output: &Output) -> BufReader<FlushBeforeRead<'_>> {
+    BufReader::new(FlushBeforeRead { input, output })
 }
 
 // Decodes each CBOR item and pretty-prints it as diagnostic notation or, with
 // `--json`, as JSON. The diagnostic path works on wire bytes and preserves
 // indefinite-length markers; the JSON path re-spells through `Value`.
-fn decode(input: Box<dyn Read>, output: DecodeOutput) -> Result<(), Error> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+fn decode(input: Box<dyn Read>, json: bool) -> Result<(), Error> {
+    let output = output();
+    let input = streaming(input, &output);
 
-    match output {
-        DecodeOutput::Diag => {
-            for item in cbor2::de::Deserializer::from_reader(input).into_iter::<RawValue>() {
-                let text = cbor2::to_cdn_pretty(item?.as_ref())?;
-                writeln!(stdout, "{text}")?;
-            }
+    if json {
+        let mut text = Vec::new();
+        for item in cbor2::de::Deserializer::from_reader(input).into_iter::<Value>() {
+            // Convert the whole item before writing any of it: a colliding
+            // key must not leave a partial document behind.
+            text.clear();
+            serde_json::to_writer_pretty(&mut text, &Json(&item?))?;
+            text.push(b'\n');
+            output.borrow_mut().write_all(&text)?;
         }
-        DecodeOutput::Json => {
-            let mut stdout = BufWriter::new(stdout);
-            for item in cbor2::de::Deserializer::from_reader(input).into_iter::<Value>() {
-                let json = to_json(item?)?;
-                serde_json::to_writer_pretty(&mut stdout, &json)?;
-                stdout.write_all(b"\n")?;
-                // Keep complete items visible even while the input stays open.
-                stdout.flush()?;
-            }
-            return Ok(stdout.flush()?);
+    } else {
+        for item in cbor2::de::Deserializer::from_reader(input).into_iter::<RawValue>() {
+            let text = cbor2::to_cdn_pretty(item?.as_ref())?;
+            writeln!(output.borrow_mut(), "{text}")?;
         }
     }
 
-    Ok(stdout.flush()?)
+    Ok(output.into_inner().flush()?)
 }
 
 // Validates one or more complete CBOR items. This is deliberately a sequence
 // check because the rest of the CLI accepts CBOR sequences item by item.
 fn validate(input: Box<dyn Read>) -> Result<(), Error> {
+    let input = BufReader::new(input);
     let mut count = 0usize;
     for item in cbor2::de::Deserializer::from_reader(input).into_iter::<serde::de::IgnoredAny>() {
         item?;
@@ -346,128 +341,121 @@ fn validate(input: Box<dyn Read>) -> Result<(), Error> {
         return Err("expected at least one CBOR item".into());
     }
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = io::stdout().lock();
     writeln!(stdout, "valid")?;
     Ok(stdout.flush()?)
 }
 
 // Reads a stream with the CDN parser by default, or the strict JSON parser
 // with `--json`, and writes it to stdout as CBOR items. Raw output streams
-// bytes; hex output streams one copyable lowercase hex string for the complete
-// CBOR sequence.
-fn encode(mut input: Box<dyn Read>, output: EncodeOutput, mode: EncodeInput) -> Result<(), Error> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    let mut wrote_hex = false;
+// bytes; hex output streams one copyable lowercase hex line for the complete
+// CBOR sequence. Both parsers keep map entries in input order, including
+// duplicate keys, so the same JSON text encodes to the same bytes.
+fn encode(mut input: Box<dyn Read>, json: bool, hex: bool) -> Result<(), Error> {
+    let output = output();
+    let write = |bytes: &[u8]| {
+        let mut output = output.borrow_mut();
+        if hex {
+            write!(output, "{}", Hex(bytes))
+        } else {
+            output.write_all(bytes)
+        }
+    };
 
-    if mode != EncodeInput::Json {
+    if json {
+        let mut item = Vec::new();
+        let input = serde_json::Deserializer::from_reader(streaming(input, &output));
+        for value in input.into_iter::<Value>() {
+            item.clear();
+            cbor2::to_writer(&value?, &mut item)?;
+            write(&item)?;
+        }
+    } else {
         let mut text = String::new();
         input.read_to_string(&mut text)?;
-        let bytes = cbor2::cdn_sequence_to_vec(&text)?;
-        match output {
-            EncodeOutput::Raw => stdout.write_all(&bytes)?,
-            EncodeOutput::Hex => {
-                write_hex(&mut stdout, &bytes)?;
-                stdout.write_all(b"\n")?;
-            }
-        }
-        return Ok(stdout.flush()?);
+        write(&cbor2::cdn_sequence_to_vec(&text)?)?;
     }
 
-    for value in serde_json::Deserializer::from_reader(input).into_iter::<serde_json::Value>() {
-        match output {
-            EncodeOutput::Raw => cbor2::to_writer(&value?, &mut stdout)?,
-            EncodeOutput::Hex => {
-                let item = cbor2::to_vec(&value?)?;
-                write_hex(&mut stdout, &item)?;
-                wrote_hex = true;
-            }
-        }
+    if hex {
+        output.borrow_mut().write_all(b"\n")?;
     }
-
-    if wrote_hex {
-        stdout.write_all(b"\n")?;
-    }
-
-    Ok(stdout.flush()?)
+    Ok(output.into_inner().flush()?)
 }
 
-// Converts a CBOR value to the closest JSON value.
+// The closest JSON form of a CBOR value.
 //
 // CBOR constructs that have no JSON equivalent are converted as follows:
 // byte strings become lowercase hex strings, non-string map keys are
 // JSON-encoded into strings, non-finite floats become null, tags are
 // dropped (the inner value is kept), generic simple values become
 // `simple(N)` strings, integers beyond the 64-bit ranges become strings
-// and the "undefined" simple value becomes null. Colliding object keys are
-// rejected, including collisions in nested values or compound keys.
-fn to_json(value: Value) -> Result<serde_json::Value, Error> {
-    use serde_json::Value as Json;
+// and the "undefined" simple value becomes null. Map entries keep their
+// CBOR order. Colliding object keys are rejected, including collisions in
+// nested values or compound keys.
+struct Json<'a>(&'a Value);
 
-    Ok(match value {
-        Value::Null => Json::Null,
-        Value::Bool(x) => Json::Bool(x),
-        Value::Integer(x) => match (u64::try_from(x), i64::try_from(x)) {
-            (Ok(x), _) => Json::from(x),
-            (_, Ok(x)) => Json::from(x),
-            // Outside both ranges (e.g. near -2^64): fall back to a string.
-            _ => Json::String(i128::from(x).to_string()),
-        },
-        Value::Float(x) => serde_json::Number::from_f64(x).map_or(Json::Null, Json::Number),
-        Value::Bytes(x) => Json::String(hex(&x)),
-        Value::Text(x) => Json::String(x),
-        Value::Simple(x) => Json::String(format!("simple({})", x.value())),
-        Value::Tag(_, x) => to_json(*x)?,
-        Value::Array(x) => Json::Array(x.into_iter().map(to_json).collect::<Result<_, _>>()?),
-        Value::Map(x) => {
-            let mut map = serde_json::Map::new();
-            for (key, value) in x {
-                let key = match key {
-                    Value::Text(s) => s,
-                    other => serde_json::to_string(&to_json(other)?)?,
-                };
-                match map.entry(key) {
-                    serde_json::map::Entry::Vacant(entry) => {
-                        entry.insert(to_json(value)?);
+impl serde::Serialize for Json<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error as _, SerializeMap as _};
+
+        match self.0 {
+            Value::Null => serializer.serialize_unit(),
+            Value::Bool(x) => serializer.serialize_bool(*x),
+            Value::Integer(x) => match (u64::try_from(*x), i64::try_from(*x)) {
+                (Ok(x), _) => serializer.serialize_u64(x),
+                (_, Ok(x)) => serializer.serialize_i64(x),
+                // Outside both ranges (e.g. near -2^64): fall back to a string.
+                _ => serializer.collect_str(&i128::from(*x)),
+            },
+            // serde_json writes non-finite floats as null.
+            Value::Float(x) => serializer.serialize_f64(*x),
+            Value::Bytes(x) => serializer.collect_str(&Hex(x)),
+            Value::Text(x) => serializer.serialize_str(x),
+            Value::Simple(x) => serializer.collect_str(&format_args!("simple({})", x.value())),
+            Value::Tag(_, x) => Json(x).serialize(serializer),
+            Value::Array(x) => serializer.collect_seq(x.iter().map(Json)),
+            Value::Map(x) => {
+                let mut keys = HashSet::with_capacity(x.len());
+                let mut map = serializer.serialize_map(Some(x.len()))?;
+                for (key, value) in x {
+                    let key = match key {
+                        Value::Text(key) => Cow::Borrowed(key.as_str()),
+                        key => {
+                            Cow::Owned(serde_json::to_string(&Json(key)).map_err(S::Error::custom)?)
+                        }
+                    };
+                    if !keys.insert(key.clone()) {
+                        return Err(S::Error::custom(format_args!(
+                            "duplicate JSON object key {key:?} after CBOR key conversion"
+                        )));
                     }
-                    serde_json::map::Entry::Occupied(entry) => {
-                        return Err(format!(
-                            "duplicate JSON object key {:?} after CBOR key conversion",
-                            entry.key()
-                        )
-                        .into());
-                    }
+                    map.serialize_entry(&key, &Json(value))?;
                 }
+                map.end()
             }
-            Json::Object(map)
+            _ => serializer.serialize_unit(),
         }
-        _ => Json::Null,
-    })
+    }
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-// Bound temporary memory independently of the encoded item size.
-fn write_hex(output: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
-    let mut buffer = [0u8; 4096];
-    for chunk in bytes.chunks(buffer.len() / 2) {
-        for (byte, pair) in chunk.iter().zip(buffer.as_chunks_mut::<2>().0) {
-            pair[0] = HEX[(byte >> 4) as usize];
-            pair[1] = HEX[(byte & 15) as usize];
-        }
-        output.write_all(&buffer[..chunk.len() * 2])?;
-    }
-    Ok(())
-}
+// Lowercase hex text, formatted through a bounded buffer so temporary memory
+// does not grow with the item size.
+struct Hex<'a>(&'a [u8]);
 
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from(HEX[(b >> 4) as usize]));
-        out.push(char::from(HEX[(b & 15) as usize]));
+impl fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buffer = [0u8; 4096];
+        for chunk in self.0.chunks(buffer.len() / 2) {
+            for (byte, pair) in chunk.iter().zip(buffer.as_chunks_mut::<2>().0) {
+                *pair = [HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]];
+            }
+            let text = std::str::from_utf8(&buffer[..chunk.len() * 2]).map_err(|_| fmt::Error)?;
+            f.write_str(text)?;
+        }
+        Ok(())
     }
-    out
 }
 
 // Decodes a hex string — optionally 0x-prefixed, ASCII whitespace

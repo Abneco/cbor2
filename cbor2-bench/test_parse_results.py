@@ -36,6 +36,11 @@ time: [1 ns 2 ns 3 ns]
 time: [4 ns 5 ns 6 ns]
 """), {"std/encode/blob/cbor2": "2 ns"})
 
+    def test_sub_nanosecond_estimates_use_picoseconds(self):
+        self.assertEqual(self.parse("""no_alloc/serialized_size (cbor2)/blob
+                        time:   [720.46 ps 747.53 ps 782.18 ps]
+"""), {"no_alloc/serialized_size (cbor2)/blob": "747.53 ps"})
+
     def test_spaces_colors_and_other_criterion_output(self):
         results = self.parse("""Benchmarking no_alloc/scan/blob/cbor2 (validate_slice): Analyzing
 \x1b[32mno_alloc/scan/blob/cbor2 (validate_slice)\x1b[0m

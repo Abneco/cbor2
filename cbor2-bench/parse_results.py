@@ -5,7 +5,7 @@ import re
 
 ID_RE = re.compile(r"^(alloc|std|no_alloc|focused|review|derive)/\S[^\r\n]*")
 # The middle value is the slope (or mean) point estimate, not the median.
-VALUE = r"[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?\s+(?:ns|µs|us|ms|s)"
+VALUE = r"[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?\s+(?:ps|ns|µs|us|ms|s)"
 TIME_RE = re.compile(rf"time:\s*\[\s*({VALUE})\s+({VALUE})\s+({VALUE})\s*\]")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 

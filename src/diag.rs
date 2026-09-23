@@ -508,14 +508,14 @@ fn item_header<'a, R: Read>(
                 }
             }
             (None, Some(ind)) => {
-                let mut pending: Option<(String, Option<&str>)> = None;
+                let mut first = true;
+                let mut pending_comment = None;
                 loop {
                     let offset = decoder.offset();
                     match decoder.pull()? {
                         Header::Break => {
-                            if let Some((entry, comment)) = pending {
-                                out.push_str(&entry);
-                                if let Some(comment) = comment {
+                            if !first {
+                                if let Some(comment) = pending_comment {
                                     push_key_comment(out, comment);
                                 }
                                 out.push('\n');
@@ -527,30 +527,31 @@ fn item_header<'a, R: Read>(
                             return Ok(());
                         }
                         header => {
-                            if let Some((entry, comment)) = pending.take() {
-                                out.push_str(&entry);
+                            if !first {
                                 out.push(',');
-                                if let Some(comment) = comment {
+                                if let Some(comment) = pending_comment.take() {
                                     push_key_comment(out, comment);
                                 }
                                 out.push('\n');
                             } else {
                                 out.push_str("{_\n");
+                                first = false;
                             }
 
-                            let comment = key_comment(header, key_comments);
-                            let mut entry = String::new();
-                            push_indent(&mut entry, ind + 1);
+                            // Only the comma and comment depend on whether
+                            // another entry follows; write the entry directly.
+                            pending_comment = key_comment(header, key_comments);
+                            push_indent(out, ind + 1);
                             item_header(
                                 decoder,
                                 header,
-                                &mut entry,
+                                out,
                                 offset,
                                 depth - 1,
                                 Some(ind + 1),
                                 key_comments,
                             )?;
-                            entry.push_str(": ");
+                            out.push_str(": ");
                             let offset = decoder.offset();
                             match decoder.pull()? {
                                 Header::Break => return Err(Error::Syntax(offset)),
@@ -558,7 +559,7 @@ fn item_header<'a, R: Read>(
                                     item_header(
                                         decoder,
                                         header,
-                                        &mut entry,
+                                        out,
                                         offset,
                                         depth - 1,
                                         Some(ind + 1),
@@ -566,7 +567,6 @@ fn item_header<'a, R: Read>(
                                     )?;
                                 }
                             }
-                            pending = Some((entry, comment));
                         }
                     }
                 }

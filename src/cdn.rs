@@ -35,6 +35,9 @@ mod types;
 /// also enables the `hash`, `cri`, and `CRI` extensions that require external
 /// crates and `std`. Use `cdn-hash` alone for hash literals with `no_std` +
 /// `alloc`, or `cdn-cri` for CRI alone. The default encoding is preferred serialization.
+/// Errors while evaluating an application extension point to its argument's
+/// opening delimiter in the source, since decoded or computed arguments may
+/// no longer correspond byte for byte to the original text.
 ///
 /// Encoding indicators that carry no defined meaning here — the reserved
 /// `_4` through `_7`, indicator words from future registrations, and the

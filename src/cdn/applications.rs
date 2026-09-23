@@ -8,11 +8,7 @@ use super::encode::{
 };
 use super::types::{Arg, Atom, ElidedStringPart, Indicator, ELLIPSIS_TAG, UNRESOLVED_APP_TAG};
 
-pub(super) fn unresolved_app_sequence(
-    prefix: &str,
-    args: Vec<Arg>,
-    offset: usize,
-) -> Result<Atom, Error> {
+pub(super) fn unresolved_app_sequence(prefix: &str, args: Vec<Arg>) -> Result<Atom, Error> {
     let mut out = Vec::new();
     write_tag(&mut out, UNRESOLVED_APP_TAG)?;
     write_array_len(&mut out, 2)?;
@@ -20,9 +16,6 @@ pub(super) fn unresolved_app_sequence(
     write_array_len(&mut out, args.len())?;
     for arg in args {
         out.extend_from_slice(&arg.into_encoded()?);
-    }
-    if out.is_empty() {
-        return Err(Error::Syntax(offset));
     }
     Ok(Atom::Raw(out))
 }
@@ -329,7 +322,8 @@ impl HexContent<'_> {
     }
 
     fn parse(&mut self) -> Result<HexParsed, Error> {
-        let mut nibbles = Vec::new();
+        let mut bytes = Vec::new();
+        let mut high = None;
         let mut parts = Vec::new();
         let mut saw_elision = false;
         loop {
@@ -338,7 +332,10 @@ impl HexContent<'_> {
                 break;
             }
             if self.rest().starts_with("...") {
-                flush_hex_nibbles(&mut nibbles, &mut parts, self.base_offset + self.pos)?;
+                if high.is_some() {
+                    return Err(self.syntax());
+                }
+                flush_hex_bytes(&mut bytes, &mut parts);
                 while self.eat(".") {}
                 saw_elision = true;
                 push_elided_part(&mut parts, ElidedStringPart::Ellipsis);
@@ -348,13 +345,19 @@ impl HexContent<'_> {
             let Some(digit) = ch.to_digit(16) else {
                 return Err(self.syntax());
             };
-            nibbles.push(digit as u8);
+            match high.take() {
+                Some(high) => bytes.push((high << 4) | digit as u8),
+                None => high = Some(digit as u8),
+            }
+        }
+        if high.is_some() {
+            return Err(self.syntax());
         }
         if saw_elision {
-            flush_hex_nibbles(&mut nibbles, &mut parts, self.base_offset + self.pos)?;
+            flush_hex_bytes(&mut bytes, &mut parts);
             Ok(HexParsed::Elided(parts))
         } else {
-            hex_nibbles_to_bytes(&nibbles, self.base_offset + self.pos).map(HexParsed::Complete)
+            Ok(HexParsed::Complete(bytes))
         }
     }
 }
@@ -364,29 +367,10 @@ enum HexParsed {
     Elided(Vec<ElidedStringPart>),
 }
 
-fn flush_hex_nibbles(
-    nibbles: &mut Vec<u8>,
-    parts: &mut Vec<ElidedStringPart>,
-    offset: usize,
-) -> Result<(), Error> {
-    if nibbles.is_empty() {
-        return Ok(());
+fn flush_hex_bytes(bytes: &mut Vec<u8>, parts: &mut Vec<ElidedStringPart>) {
+    if !bytes.is_empty() {
+        push_elided_part(parts, ElidedStringPart::Bytes(core::mem::take(bytes)));
     }
-    let bytes = hex_nibbles_to_bytes(nibbles, offset)?;
-    nibbles.clear();
-    push_elided_part(parts, ElidedStringPart::Bytes(bytes));
-    Ok(())
-}
-
-fn hex_nibbles_to_bytes(nibbles: &[u8], offset: usize) -> Result<Vec<u8>, Error> {
-    if !nibbles.len().is_multiple_of(2) {
-        return Err(Error::Syntax(offset));
-    }
-    let mut out = Vec::with_capacity(nibbles.len() / 2);
-    for &[high, low] in nibbles.as_chunks::<2>().0 {
-        out.push((high << 4) | low);
-    }
-    Ok(out)
 }
 
 pub(super) fn base64_content(content: &str, offset: usize) -> Result<Vec<u8>, Error> {

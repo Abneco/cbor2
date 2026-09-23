@@ -3,7 +3,7 @@
 import re
 import sys
 
-ID_RE = re.compile(r"^(alloc|std|no_alloc|focused)/\S+")
+ID_RE = re.compile(r"^(alloc|std|no_alloc|focused|review)/\S+")
 # median is the middle value inside `time:   [low  median  high]`
 TIME_RE = re.compile(r"time:\s*\[\s*(\S+ \S+)\s+(\S+ \S+)\s+(\S+ \S+)\s*\]")
 
@@ -69,7 +69,7 @@ for p in PAYLOADS:
     print(f"| `{p}` | {fmt(results.get('no_alloc/serialized_size (cbor2)/' + p))} |")
 print(f"\n_({len(results)} measurements parsed)_")
 
-focused = [(key, value) for key, value in sorted(results.items()) if key.startswith("focused/")]
+focused = [(key, value) for key, value in sorted(results.items()) if key.startswith(("focused/", "review/"))]
 if focused:
     print("\n### Focused workloads\n\n| operation | estimate |\n|---|---|")
     for key, value in focused:

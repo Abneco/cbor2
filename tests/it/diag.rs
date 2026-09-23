@@ -283,6 +283,11 @@ fn pretty_diagnostic_can_comment_integer_keys() {
     );
 
     assert_eq!(
+        pretty_with_key_comments("bf01bf0203ff046178ff", &[("outer", 1), ("inner", 2)]),
+        "{_\n  1: {_\n    2: 3 // \"inner\"\n  }, // \"outer\"\n  4: \"x\"\n}"
+    );
+
+    assert_eq!(
         pretty_with_key_comments("a12001", &[("line\n\"", -1)]),
         "{\n  -1: 1 // \"line\\n\\\"\"\n}"
     );

@@ -84,7 +84,7 @@ fn hash_alg_from_name(name: &str, offset: usize) -> Result<HashAlg, Error> {
     }
 }
 
-pub(super) fn hash_atom(data: Vec<u8>, alg: Option<HashAlg>, offset: usize) -> Result<Atom, Error> {
+pub(super) fn hash_atom(data: Vec<u8>, alg: Option<HashAlg>) -> Atom {
     use sha2::{Digest, Sha256, Sha384, Sha512, Sha512_256};
     use shake::{
         digest::{ExtendableOutput, Update, XofReader},
@@ -116,8 +116,5 @@ pub(super) fn hash_atom(data: Vec<u8>, alg: Option<HashAlg>, offset: usize) -> R
         }
     };
 
-    if bytes.is_empty() {
-        return Err(Error::Syntax(offset));
-    }
-    Ok(Atom::Bytes(bytes))
+    Atom::Bytes(bytes)
 }

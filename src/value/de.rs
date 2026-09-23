@@ -310,6 +310,8 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
 
         match value {
             Value::Bool(x) => visitor.visit_bool(*x),
+            Value::Simple(crate::Simple::FALSE) => visitor.visit_bool(false),
+            Value::Simple(crate::Simple::TRUE) => visitor.visit_bool(true),
             _ => Err(de::Error::invalid_type(value.into(), &"bool")),
         }
     }
@@ -495,7 +497,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         _len: usize,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        match unwrap_struct_tag(name, self.0)? {
+        match unwrap_struct_tag(name, self.0) {
             Some(value) => self.nested(value).deserialize_seq(visitor),
             None => self.deserialize_seq(visitor),
         }
@@ -542,13 +544,17 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        self.deserialize_any(visitor)
+        // The tree is already in memory; skipping it consumes no input and
+        // needs no traversal of the ignored subtree.
+        visitor.visit_unit()
     }
 
     #[inline]
     fn deserialize_option<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.0 {
-            Value::Null => visitor.visit_none(),
+            Value::Null | Value::Simple(crate::Simple::NULL | crate::Simple::UNDEFINED) => {
+                visitor.visit_none()
+            }
             x => visitor.visit_some(Self(x, self.1)),
         }
     }
@@ -561,7 +567,9 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         }
 
         match value {
-            Value::Null => visitor.visit_unit(),
+            Value::Null | Value::Simple(crate::Simple::NULL | crate::Simple::UNDEFINED) => {
+                visitor.visit_unit()
+            }
             _ => Err(de::Error::invalid_type(value.into(), &"null")),
         }
     }
@@ -572,7 +580,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
         name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        match unwrap_struct_tag(name, self.0)? {
+        match unwrap_struct_tag(name, self.0) {
             Some(value) => self.nested(value).deserialize_unit(visitor),
             None => self.deserialize_unit(visitor),
         }
@@ -590,7 +598,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
             return visitor.visit_byte_buf(bytes);
         }
 
-        match unwrap_struct_tag(name, self.0)? {
+        match unwrap_struct_tag(name, self.0) {
             Some(value) => visitor.visit_newtype_struct(self.nested(value)),
             None => visitor.visit_newtype_struct(self),
         }
@@ -703,6 +711,14 @@ impl<'a, 'de, T: Iterator<Item = &'a Value>> de::SeqAccess<'de> for Deserializer
             Some(v) => seed.deserialize(Deserializer(v, mode)).map(Some),
         }
     }
+
+    #[inline]
+    fn size_hint(&self) -> Option<usize> {
+        match self.0.size_hint() {
+            (lower, Some(upper)) if lower == upper => Some(upper),
+            _ => None,
+        }
+    }
 }
 
 impl<'a, 'de, T: Iterator<Item = &'a (Value, Value)>> de::MapAccess<'de>
@@ -762,21 +778,18 @@ impl<'a, 'de, T: Iterator<Item = &'a (Value, Value)>> de::MapAccess<'de>
 
 // Walks the tag layers of a tagged marked struct's value. Returns `None` —
 // keep the value and the default handling — for unmarked or untagged structs.
-fn unwrap_struct_tag<'x>(
-    name: &'static str,
-    mut value: &'x Value,
-) -> Result<Option<&'x Value>, Error> {
+fn unwrap_struct_tag<'x>(name: &'static str, mut value: &'x Value) -> Option<&'x Value> {
     let Some(crate::ser::StructMarker { tag: Some(..), .. }) =
         crate::ser::parse_struct_marker(name)
     else {
-        return Ok(None);
+        return None;
     };
 
     while let Value::Tag(.., v) = value {
         value = v;
     }
 
-    Ok(Some(value))
+    Some(value)
 }
 
 // Map access for a marked struct: integer keys translate to field names
@@ -985,7 +998,7 @@ impl<'de> de::VariantAccess<'de> for Deserializer<&Value> {
         }
 
         match value {
-            Value::Null => Ok(()),
+            Value::Null | Value::Simple(crate::Simple::NULL | crate::Simple::UNDEFINED) => Ok(()),
             _ => Err(de::Error::invalid_type(value.into(), &"unit")),
         }
     }

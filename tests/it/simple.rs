@@ -118,6 +118,48 @@ fn value_bridge_decodes_builtin_simple_values() {
 }
 
 #[test]
+fn builtin_simple_typed_conversions_match_wire() {
+    fn check<T: serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(value: &Value) {
+        let bytes = cbor2::to_vec(value).unwrap();
+        match (value.deserialized::<T>(), cbor2::from_slice::<T>(&bytes)) {
+            (Ok(value), Ok(wire)) => assert_eq!(value, wire),
+            (Err(_), Err(_)) => {}
+            (value, wire) => panic!("conversion mismatch: Value={value:?}, wire={wire:?}"),
+        }
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct Unit;
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    enum Variant {
+        Unit,
+    }
+
+    for simple in [
+        Simple::FALSE,
+        Simple::TRUE,
+        Simple::NULL,
+        Simple::UNDEFINED,
+        Simple::new(59).unwrap(),
+    ] {
+        let plain = Value::serialized(&simple).unwrap();
+        for value in [plain.clone(), Value::Tag(7, Box::new(plain))] {
+            check::<bool>(&value);
+            check::<()>(&value);
+            check::<Unit>(&value);
+            check::<Option<bool>>(&value);
+            check::<Option<()>>(&value);
+            check::<Option<u64>>(&value);
+            check::<Option<Simple>>(&value);
+            check::<Simple>(&value);
+            // The generic representation continues to preserve simple values.
+            assert_eq!(value.deserialized::<Value>().unwrap(), value);
+            check::<Variant>(&Value::Map(vec![("Unit".into(), value)]));
+        }
+    }
+}
+
+#[test]
 fn canonical_encoding_sorts_simple_keys_by_encoded_bytes() {
     let mut value = Value::Map(vec![
         (Value::Simple(Simple::new(59).unwrap()), Value::Null),

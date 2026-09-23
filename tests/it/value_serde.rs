@@ -830,3 +830,34 @@ fn map_value_without_key_is_an_error() {
         "{err}"
     );
 }
+
+#[test]
+fn value_struct_ignores_unknown_subtrees_between_known_fields() {
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct Record {
+        id: u64,
+        enabled: bool,
+    }
+    let value = Value::Map(vec![
+        ("id".into(), 42.into()),
+        (
+            "extra".into(),
+            Value::Array(vec![
+                Value::Tag(7, Box::new(Value::Bytes(vec![0xff; 1024]))),
+                Value::Simple(cbor2::Simple::new(59).unwrap()),
+                cbor!({"nested": [1, 2, 3]}).unwrap(),
+            ]),
+        ),
+        ("enabled".into(), true.into()),
+    ]);
+    let record = value.deserialized::<Record>().unwrap();
+    assert_eq!(
+        record,
+        Record {
+            id: 42,
+            enabled: true
+        }
+    );
+    let bytes = cbor2::to_vec(&value).unwrap();
+    assert_eq!(record, cbor2::from_slice::<Record>(&bytes).unwrap());
+}

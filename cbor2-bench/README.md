@@ -24,6 +24,7 @@ cd cbor2-bench
 cargo bench                 # everything
 cargo bench --bench alloc   # one scenario
 cargo bench --bench std -- 'encode/log_batch'   # one criterion filter
+cargo bench --bench focused -- review          # Value, diagnostics, hex and capacity workloads
 
 cargo run --release --bin sizes   # encoded-size table only
 ```

@@ -108,6 +108,7 @@ fn ordered<'a>(
 ) -> Result<(Vec<u8>, Vec<Entry<'a>>), crate::ser::Error> {
     let mut arena = Vec::new();
     let mut entries = Vec::with_capacity(pairs.len());
+    let mut same_order = true;
     for (original, (key, value)) in pairs.iter().enumerate() {
         let start = arena.len();
         encode(
@@ -119,6 +120,7 @@ fn ordered<'a>(
         )?;
         let encoded = start..arena.len();
         let equivalent = if !zero && has_negative_zero(key) {
+            same_order = false;
             let start = arena.len();
             encode(
                 key,
@@ -146,14 +148,18 @@ fn ordered<'a>(
     {
         return Err(crate::ser::Error::msg("duplicate map key"));
     }
-    entries.sort_unstable_by(|a, b| {
-        let a = &arena[a.encoded.clone()];
-        let b = &arena[b.encoded.clone()];
-        match order {
-            KeyOrder::Bytewise => a.cmp(b),
-            KeyOrder::LengthFirst => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
-        }
-    });
+    // For ordinary bytewise keys, the duplicate check already established
+    // the output order. Only length-first or signed-zero keys need a re-sort.
+    if order != KeyOrder::Bytewise || !same_order {
+        entries.sort_unstable_by(|a, b| {
+            let a = &arena[a.encoded.clone()];
+            let b = &arena[b.encoded.clone()];
+            match order {
+                KeyOrder::Bytewise => a.cmp(b),
+                KeyOrder::LengthFirst => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+            }
+        });
+    }
     Ok((arena, entries))
 }
 

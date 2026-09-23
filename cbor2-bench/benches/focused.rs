@@ -4,6 +4,72 @@ use cbor2::{Cbor, RawValue, Value};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::{collections::BTreeMap, hint::black_box};
 
+#[derive(serde::Deserialize)]
+struct KnownFields {
+    id: u64,
+}
+
+#[derive(serde::Serialize)]
+struct ArrayRecord {
+    id: u64,
+    enabled: bool,
+}
+
+fn review(c: &mut Criterion) {
+    let array = Value::Array((0..1024u64).map(Value::from).collect());
+    c.bench_function("review/value_array", |b| {
+        b.iter(|| black_box(&array).deserialized::<Vec<u64>>().unwrap())
+    });
+    let record = Value::Map(vec![("id".into(), 42.into()), ("extra".into(), array)]);
+    c.bench_function("review/value_ignore", |b| {
+        b.iter(|| black_box(&record).deserialized::<KnownFields>().unwrap().id)
+    });
+
+    let mut map = vec![0xbf];
+    for n in 0..128u64 {
+        cbor2::to_writer(&n, &mut map).unwrap();
+        cbor2::to_writer(&n, &mut map).unwrap();
+    }
+    map.push(0xff);
+    c.bench_function("review/pretty_indefinite_map", |b| {
+        b.iter(|| cbor2::to_cdn_pretty(black_box(map.as_slice())).unwrap())
+    });
+    let text = format!("h'{}'", "ab".repeat(4096));
+    c.bench_function("review/hex_literal", |b| {
+        b.iter(|| cbor2::cdn_to_vec(black_box(&text)).unwrap())
+    });
+    let map = Value::Map((0..1024u64).rev().map(|n| (n.into(), n.into())).collect());
+    c.bench_function("review/canonical_map", |b| {
+        b.iter(|| cbor2::to_canonical_vec(black_box(&map)).unwrap())
+    });
+
+    let mut group = c.benchmark_group("review/array_encode");
+    for n in [16, 1024, 10000] {
+        let flags = vec![true; n];
+        group.bench_with_input(BenchmarkId::new("bool", n), &flags, |b, value| {
+            b.iter(|| cbor2::to_vec(black_box(value)).unwrap())
+        });
+        let small = vec![7u8; n];
+        group.bench_with_input(BenchmarkId::new("u8", n), &small, |b, value| {
+            b.iter(|| cbor2::to_vec(black_box(value)).unwrap())
+        });
+        let wide = vec![u64::MAX; n];
+        group.bench_with_input(BenchmarkId::new("u64", n), &wide, |b, value| {
+            b.iter(|| cbor2::to_vec(black_box(value)).unwrap())
+        });
+        let records: Vec<_> = (0..n)
+            .map(|n| ArrayRecord {
+                id: n as u64,
+                enabled: true,
+            })
+            .collect();
+        group.bench_with_input(BenchmarkId::new("struct", n), &records, |b, value| {
+            b.iter(|| cbor2::to_vec(black_box(value)).unwrap())
+        });
+    }
+    group.finish();
+}
+
 #[derive(Cbor)]
 struct OpenRecord {
     #[cbor(key = 1)]
@@ -109,5 +175,5 @@ fn focused(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, focused);
+criterion_group!(benches, focused, review);
 criterion_main!(benches);

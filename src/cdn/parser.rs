@@ -572,18 +572,30 @@ impl<'a> Parser<'a> {
         }
 
         let prefix = self.app_prefix()?;
+        let argument_offset = self.pos;
         let atom = if self.starts_with("<<") {
             let args = self.sequence_args(depth)?;
-            self.apply_app_sequence(prefix, args)?
+            self.apply_app_sequence(prefix, args)
         } else if self.peek() == Some('\'') {
             let content = self.quoted_string('\'')?;
-            self.apply_app_string(prefix, content)?
+            self.apply_app_string(prefix, content)
         } else if self.peek() == Some('`') {
             let content = self.raw_string()?;
-            self.apply_app_string(prefix, content)?
+            self.apply_app_string(prefix, content)
         } else {
             return Err(self.syntax());
-        };
+        }
+        .map_err(|error| {
+            // Extensions work on decoded strings or computed CBOR values,
+            // whose offsets are not source offsets. Locate evaluation errors
+            // at the argument's opening delimiter; parse errors above keep
+            // their precise source position, including nested extensions.
+            match error {
+                Error::Syntax(_) => Error::Syntax(argument_offset),
+                Error::Semantic(_, message) => Error::semantic(argument_offset, message),
+                other => other,
+            }
+        })?;
         let spec = self.parse_spec();
         self.emit_atom(out, atom, spec)
     }
@@ -726,14 +738,13 @@ impl<'a> Parser<'a> {
             self.bump();
         }
 
-        let mut is_float = false;
-        if self.eat(".") {
-            is_float = true;
+        let has_dot = self.eat(".");
+        if has_dot {
             while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
                 self.bump();
             }
         }
-        if digits_before == 0 && !is_float {
+        if digits_before == 0 && !has_dot {
             return Err(self.syntax());
         }
         if digits_before == 0 && &self.input[start..self.pos] == "." {
@@ -741,7 +752,6 @@ impl<'a> Parser<'a> {
         }
 
         if matches!(self.peek(), Some('e' | 'E')) {
-            is_float = true;
             self.bump();
             if matches!(self.peek(), Some('+' | '-')) {
                 self.bump();
@@ -755,9 +765,6 @@ impl<'a> Parser<'a> {
             }
         }
 
-        if self.input[start..self.pos].ends_with('.') && !is_float {
-            return Err(self.syntax());
-        }
         Ok(&self.input[start..self.pos])
     }
 
@@ -987,14 +994,14 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "cdn-hash")]
             "hash" => {
                 let (data, alg) = hash_args(args, self.pos)?;
-                hash_atom(data, alg, self.pos)
+                Ok(hash_atom(data, alg))
             }
             #[cfg(feature = "cdn-cri")]
             "cri" | "CRI" => {
                 let content = one_text_arg(prefix, args, self.pos)?;
                 cri_atom(&content, prefix == "CRI", self.pos)
             }
-            _ => unresolved_app_sequence(prefix, args, self.pos),
+            _ => unresolved_app_sequence(prefix, args),
         }
     }
 

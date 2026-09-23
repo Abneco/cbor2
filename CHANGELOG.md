@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+* Match byte decoding when converting built-in `Value::Simple` values to bool,
+  unit, Option and unit enum variants, while preserving the generic Simple form.
+* Report CDN application-extension evaluation errors at the source argument's
+  opening delimiter, including escaped, computed and CR-normalized arguments.
+
+### Performance
+
+* Use exact size hints for Value arrays and skip ignored Value subtrees directly.
+* Format indefinite maps without per-entry strings, avoid redundant canonical
+  key sorting in the ordinary bytewise case, and decode hex literals directly
+  into bytes without a nibble buffer.
+* Add allocation regressions and focused benchmarks; retain the existing array
+  capacity heuristic after comparing smaller reservation strategies.
+* Simplify infallible internal helpers and document compatibility entry points
+  still required by older derive releases.
+
 ## [1.1.5] - 2026-09-06
 
 ### Fixed

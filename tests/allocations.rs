@@ -90,3 +90,31 @@ fn cli_style_validation_does_not_buffer_item_payload() {
     });
     assert_eq!(counts, (0, 0));
 }
+
+#[test]
+fn value_array_to_vec_allocates_once() {
+    for length in [16, 128, 1024] {
+        let values: Vec<u64> = (0..length).collect();
+        let value = cbor2::Value::serialized(&values).unwrap();
+        let (decoded, counts) = measured(|| value.deserialized::<Vec<u64>>().unwrap());
+        assert_eq!(decoded, values);
+        assert_eq!(counts, (1, length as usize * std::mem::size_of::<u64>()));
+    }
+}
+
+#[test]
+fn pretty_indefinite_map_only_allocates_output() {
+    let mut bytes = vec![0xbf];
+    for n in 0..128u64 {
+        cbor2::to_writer(&n, &mut bytes).unwrap();
+        cbor2::to_writer(&n, &mut bytes).unwrap();
+    }
+    bytes.push(0xff);
+    let value: cbor2::Value = cbor2::from_slice(&bytes).unwrap();
+    let definite = cbor2::to_vec(&value).unwrap();
+    let (actual, counts) = measured(|| cbor2::to_cdn_pretty(bytes.as_slice()).unwrap());
+    let (expected, definite_counts) =
+        measured(|| cbor2::to_cdn_pretty(definite.as_slice()).unwrap());
+    assert_eq!(actual.replacen("{_", "{", 1), expected);
+    assert_eq!(counts.0, definite_counts.0);
+}

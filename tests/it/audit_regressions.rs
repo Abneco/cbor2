@@ -587,3 +587,47 @@ fn independently_enabled_cri_extension() {
         cdn("[-4, [\"example\", \"com\"], [\"a\"]]")
     );
 }
+
+#[test]
+fn cdn_extension_errors_point_to_source_arguments() {
+    for (input, expected) in [
+        ("dt'2024-01-01T00:00:00X'", 2),
+        ("ip'192.0.2.0/999'", 2),
+        ("h'gg'", 1),
+        ("b64'!'", 3),
+        ("dt<<\"2024-01-01T00:00:00X\">>", 2),
+        ("dt<<t1<<'2024-01-01', 'T00:00:00X'>>>>", 2),
+        ("dt<<\"2024-01-01T00:00:00\\u{58}\">>", 2),
+        ("\r[dt\r'2024-01-01T00:00:00X']", 5),
+        ("[\"中文\", dt'2024-01-01T00:00:00X']", 13),
+        ("float<<h'zz'>>", 8),
+        ("dt`2024-01-01T00:00:00X`", 2),
+        #[cfg(feature = "cdn-hash")]
+        ("hash<<5>>", 4),
+        #[cfg(feature = "cdn-cri")]
+        ("cri'https://example.com/%3A'", 3),
+    ] {
+        let error = cdn_to_vec(input).unwrap_err();
+        let offset = match error {
+            cbor2::de::Error::Syntax(offset) | cbor2::de::Error::Semantic(Some(offset), _) => {
+                offset
+            }
+            error => panic!("missing source offset for {input:?}: {error}"),
+        };
+        assert_eq!(offset, expected, "{input:?}");
+        assert!(offset < input.len());
+    }
+}
+
+#[test]
+fn hex_literals_pair_digits_across_comments_and_reject_dangling_nibbles() {
+    assert_eq!(cdn("h'a /comment/ b # next\nc d'"), cdn("h'abcd'"));
+    assert_eq!(cdn("h'ab...cd'"), cdn("888([h'ab', 888(null), h'cd'])"));
+    assert_eq!(
+        cdn("h'...ab......cd...'"),
+        cdn("888([888(null), h'ab', 888(null), h'cd', 888(null)])")
+    );
+    for input in ["h'a'", "h'a...bc'", "h'ab...c'", "h'ab...c...de'"] {
+        assert!(cdn_to_vec(input).is_err(), "{input}");
+    }
+}

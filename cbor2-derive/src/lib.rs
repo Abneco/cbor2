@@ -50,6 +50,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned as _;
 use syn::visit_mut::{self, VisitMut};
 
+mod bounds;
+
 // The marker prefix recognized by the `cbor2` serializers. Keep in sync
 // with `cbor2::ser::STRUCT_MARKER`; the integration tests of the `cbor2`
 // crate pin the resulting wire bytes.
@@ -90,7 +92,12 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
 
     let container = container_attrs(&input.attrs)?;
     let serde = scan_serde(&input.attrs);
-    if let Some(span) = serde.rename.map(|(_, span)| span).or(serde.split_rename) {
+    if let Some(span) = serde
+        .rename
+        .as_ref()
+        .map(|(_, span)| *span)
+        .or(serde.split_rename)
+    {
         return Err(syn::Error::new(
             span,
             "#[derive(Cbor)] does not support a container-level #[serde(rename = ...)]; \
@@ -98,19 +105,36 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
         ));
     }
 
+    // Parse each field/variant once for validation and impl-bound inference.
+    let groups: Vec<_> = match &input.data {
+        syn::Data::Struct(data) => vec![FieldGroup::new(&data.fields, SerdeAttrs::default())],
+        syn::Data::Enum(data) => data
+            .variants
+            .iter()
+            .map(|variant| FieldGroup::new(&variant.fields, scan_serde(&variant.attrs)))
+            .collect(),
+        syn::Data::Union(data) => {
+            return Err(syn::Error::new(
+                data.union_token.span(),
+                "Cbor supports structs and enums",
+            ))
+        }
+    };
+
     let mut entries = Vec::new();
     let mut flatten = false;
     match &input.data {
         syn::Data::Struct(data) => {
+            let fields = &groups[0].fields;
             if container.array.is_some()
                 || matches!(&data.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() > 1)
             {
-                validate_positional_fields(&data.fields)?;
+                validate_positional_fields(fields)?;
             }
-            for entry in field_entries(&data.fields)? {
+            for entry in field_entries(fields)? {
                 merge_entry(&mut entries, entry)?;
             }
-            if let Some(span) = fields_have_flatten(&data.fields) {
+            if let Some(span) = fields_have_flatten(fields) {
                 flatten = true;
                 if !matches!(data.fields, syn::Fields::Named(..)) {
                     return Err(syn::Error::new(
@@ -163,10 +187,10 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
                 return Err(syn::Error::new(span, "`array` is not supported on enums"));
             }
 
-            for variant in &data.variants {
+            for (variant, group) in data.variants.iter().zip(&groups) {
                 if matches!(&variant.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() > 1)
                 {
-                    validate_positional_fields(&variant.fields)?;
+                    validate_positional_fields(&group.fields)?;
                 }
                 if let Some(attr) = variant.attrs.iter().find(|a| a.path().is_ident("cbor")) {
                     return Err(syn::Error::new(
@@ -175,15 +199,15 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
                     ));
                 }
 
-                let keyed = field_entries(&variant.fields)?;
-                if let Some(span) = fields_have_flatten(&variant.fields) {
+                let keyed = field_entries(&group.fields)?;
+                if let Some(span) = fields_have_flatten(&group.fields) {
                     return Err(syn::Error::new(
                         span,
                         "#[serde(flatten)] with #[derive(Cbor)] is supported only on structs",
                     ));
                 }
                 if !keyed.is_empty() {
-                    if let Some(span) = scan_serde(&variant.attrs).rename_all {
+                    if let Some(span) = group.attrs.rename_all {
                         return Err(syn::Error::new(
                             span,
                             "#[serde(rename_all = ...)] is not supported with \
@@ -197,6 +221,15 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
             }
 
             if !entries.is_empty() {
+                for group in &groups {
+                    if let Some(span) = group.attrs.enum_repr {
+                        return Err(syn::Error::new(
+                            span,
+                            "untagged variants are not supported in enums with #[cbor(key = ...)]",
+                        ));
+                    }
+                }
+                validate_enum_keys(&groups, &entries)?;
                 if let Some(span) = serde.rename_all_fields {
                     return Err(syn::Error::new(
                         span,
@@ -213,18 +246,19 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
             }
         }
 
-        syn::Data::Union(data) => {
-            return Err(syn::Error::new(
-                data.union_token.span(),
-                "Cbor supports structs and enums",
-            ));
-        }
+        syn::Data::Union(..) => unreachable!("rejected above"),
     }
 
     // These container shapes make serde bypass the container name — and
     // with it the marker that carries the declared protocol details, which
     // would otherwise be dropped silently.
     if container.tag.is_some() || container.array.is_some() || !entries.is_empty() {
+        if matches!(input.data, syn::Data::Struct(..)) {
+            if let Some(span) = serde.tag {
+                return Err(syn::Error::new(span,
+                    "#[serde(tag = ...)] on a struct conflicts with #[cbor(...)] keys, tags or array shape"));
+            }
+        }
         if let Some(span) = serde.transparent {
             return Err(syn::Error::new(
                 span,
@@ -256,13 +290,7 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
     }
 
     Ok(generate(
-        &input,
-        container.tag.as_ref().map(|tag| tag.value),
-        container.array.is_some(),
-        flatten,
-        &entries,
-        serde.ser_bound.as_ref(),
-        serde.de_bound.as_ref(),
+        &input, &container, flatten, &entries, &serde, &groups,
     ))
 }
 
@@ -271,16 +299,16 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
 // to the shadow's generated functions. The shadow accesses the real
 // type's fields directly, so nothing is copied at runtime, and the real
 // type's name and field names stay exactly as written.
-#[allow(clippy::too_many_arguments)]
-fn generate(
+fn prepare_shadow(
     input: &syn::DeriveInput,
-    tag: Option<u64>,
-    array: bool,
-    flatten: bool,
+    container: &ContainerAttrs,
     entries: &[Entry],
-    ser_bound: Option<&BoundPredicates>,
-    de_bound: Option<&BoundPredicates>,
-) -> TokenStream {
+    serde: &SerdeAttrs,
+    de_generics: &syn::Generics,
+    de_lifetime: &syn::Lifetime,
+) -> syn::DeriveInput {
+    let tag = container.tag.as_ref().map(|tag| tag.value);
+    let array = container.array.is_some();
     let ident = &input.ident;
     let shadow_ident = format_ident!("__CborShadow");
 
@@ -306,7 +334,7 @@ fn generate(
         syn::Data::Union(..) => unreachable!("rejected above"),
     }
 
-    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let (_, ty_generics, _) = input.generics.split_for_impl();
 
     // The remote path: the real type, as seen from inside the const
     // block. serde applies the shadow's own generics to it, so the path
@@ -318,16 +346,18 @@ fn generate(
         syn::parse_quote!(#[serde(remote = #remote)]),
         syn::parse_quote!(#[automatically_derived]),
     ];
-    if let Some(marker) = marker(tag, array, entries, ident) {
-        head.push(syn::parse_quote!(#[serde(rename = #marker)]));
-    }
-    if !scan_serde(&input.attrs).explicit_crate {
+    let name = marker(tag, array, entries, ident).unwrap_or_else(|| {
+        let name = ident.to_string();
+        name.strip_prefix("r#").unwrap_or(&name).to_owned()
+    });
+    head.push(syn::parse_quote!(#[serde(rename = #name)]));
+    if !serde.explicit_crate {
         head.push(syn::parse_quote!(#[serde(crate = "::cbor2::__serde")]));
     }
     head.append(&mut shadow.attrs);
     shadow.attrs = head;
     ReplaceSelf { original }.visit_derive_input_mut(&mut shadow);
-    if scan_serde(&input.attrs).default {
+    if serde.default {
         let mut path: syn::Path = syn::parse_quote!(#ident #ty_generics);
         if let syn::PathArguments::AngleBracketed(args) =
             &mut path.segments.last_mut().unwrap().arguments
@@ -355,64 +385,7 @@ fn generate(
         }
     }
 
-    // `T: Serialize` / `T: Deserialize<'de>` bounds, like serde's derive —
-    // unless a container-level `#[serde(bound = ...)]` replaces them, just
-    // as it replaces serde's inferred bounds on the shadow.
-    let mut ser_generics = input.generics.clone();
-    match ser_bound {
-        Some(predicates) => ser_generics
-            .make_where_clause()
-            .predicates
-            .extend(predicates.iter().cloned()),
-        None => {
-            for param in ser_generics.type_params_mut() {
-                param
-                    .bounds
-                    .push(syn::parse_quote!(::cbor2::__serde::Serialize));
-            }
-        }
-    }
-    let (ser_impl_generics, _, ser_where_clause) = ser_generics.split_for_impl();
-
-    let de_lifetime = fresh_de_lifetime(&input.generics);
-    let mut de_generics = input.generics.clone();
-    match de_bound {
-        Some(predicates) => {
-            // serde bound strings name the deserializer lifetime `'de`;
-            // the outer impl uses a fresh one, so rename.
-            let tokens = rename_de_lifetime(quote!(#predicates), &de_lifetime);
-            let predicates: BoundPredicates = syn::parse2::<ParsedBound>(tokens)
-                .map(|bound| bound.0)
-                .unwrap_or_else(|_| predicates.clone());
-            de_generics
-                .make_where_clause()
-                .predicates
-                .extend(predicates);
-        }
-        None => {
-            for param in de_generics.type_params_mut() {
-                param
-                    .bounds
-                    .push(syn::parse_quote!(::cbor2::__serde::Deserialize<#de_lifetime>));
-            }
-        }
-    }
-    if scan_serde(&input.attrs).default {
-        de_generics
-            .make_where_clause()
-            .predicates
-            .push(syn::parse_quote!(#ident #ty_generics: ::core::default::Default));
-    }
-    let mut de_lifetime_param = syn::LifetimeParam::new(de_lifetime.clone());
-    de_lifetime_param
-        .bounds
-        .extend(input.generics.lifetimes().map(|def| def.lifetime.clone()));
-    de_generics
-        .params
-        .insert(0, syn::GenericParam::Lifetime(de_lifetime_param));
-    let (de_impl_generics, _, de_where_clause) = de_generics.split_for_impl();
-
-    if scan_serde(&input.attrs).default {
+    if serde.default {
         // The remote visitor constructs the original type. Express its
         // Default bound directly instead of serde's inferred shadow bound.
         let mut predicates = de_generics
@@ -428,8 +401,8 @@ fn generate(
             }
         }
         let serde_de_lifetime = syn::Lifetime::new("'de", proc_macro2::Span::call_site());
-        let de_text =
-            rename_lifetime(quote!(#predicates), &de_lifetime, &serde_de_lifetime).to_string();
+        bounds::rename(&mut predicates, de_lifetime, &serde_de_lifetime);
+        let de_text = quote!(#predicates).to_string();
         for attr in &mut shadow.attrs {
             if !attr.path().is_ident("serde") {
                 continue;
@@ -446,7 +419,7 @@ fn generate(
                 }
             }
         }
-        if let Some(ser_bound) = ser_bound {
+        if let Some(ser_bound) = &serde.ser_bound {
             let ser_text = quote!(#ser_bound).to_string();
             shadow.attrs.push(
                 syn::parse_quote!(#[serde(bound(serialize = #ser_text, deserialize = #de_text))]),
@@ -457,6 +430,27 @@ fn generate(
                 .push(syn::parse_quote!(#[serde(bound(deserialize = #de_text))]));
         }
     }
+
+    shadow
+}
+
+fn generate(
+    input: &syn::DeriveInput,
+    container: &ContainerAttrs,
+    flatten: bool,
+    entries: &[Entry],
+    serde: &SerdeAttrs,
+    groups: &[FieldGroup<'_>],
+) -> TokenStream {
+    let tag = container.tag.as_ref().map(|tag| tag.value);
+    let array = container.array.is_some();
+    let ident = &input.ident;
+    let shadow_ident = format_ident!("__CborShadow");
+    let (ser_generics, de_generics, de_lifetime) = bounds::build(input, serde, groups);
+    let shadow = prepare_shadow(input, container, entries, serde, &de_generics, &de_lifetime);
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let (ser_impl_generics, _, ser_where_clause) = ser_generics.split_for_impl();
+    let (de_impl_generics, _, de_where_clause) = de_generics.split_for_impl();
 
     let serde_impls = if flatten {
         let cbor_lifetime = fresh_lifetime(&input.generics, "__cbor");
@@ -589,9 +583,9 @@ fn generate(
     }
 }
 
-fn validate_positional_fields(fields: &syn::Fields) -> syn::Result<()> {
+fn validate_positional_fields(fields: &[FieldInfo<'_>]) -> syn::Result<()> {
     for field in fields {
-        let attrs = scan_serde(&field.attrs);
+        let attrs = &field.attrs;
         if attrs.skip.is_none() {
             if let Some(span) = attrs.positional_skip {
                 return Err(syn::Error::new(span, "conditional or one-directional skipping changes CBOR array field positions; use an Option placeholder or #[serde(skip)]"));
@@ -660,7 +654,7 @@ impl VisitMut for ReplaceSelf {
 }
 
 // Picks an internal deserializer lifetime that cannot collide with the
-// user's generics. User code may legitimately name a lifetime `'de`.
+// user's generics (including a user lifetime named `'__de`).
 fn fresh_de_lifetime(generics: &syn::Generics) -> syn::Lifetime {
     fresh_lifetime(generics, "__de")
 }
@@ -876,12 +870,91 @@ fn merge_entry(entries: &mut Vec<Entry>, entry: Entry) -> syn::Result<()> {
     }
 }
 
+// A marker's key table is shared by every variant. Reject unkeyed fields
+// whose effective serde name would inherit another variant's integer key.
+fn validate_enum_keys(groups: &[FieldGroup<'_>], entries: &[Entry]) -> syn::Result<()> {
+    for group in groups {
+        for info in &group.fields {
+            let Some(ident) = &info.field.ident else {
+                continue;
+            };
+            if info
+                .field
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("cbor"))
+            {
+                continue;
+            }
+            for (side, skipped) in [
+                group.attrs.skip_serializing || info.attrs.skip_serializing,
+                group.attrs.skip_deserializing || info.attrs.skip_deserializing,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if skipped {
+                    continue;
+                }
+                let ident = ident.to_string();
+                let name = ident.strip_prefix("r#").unwrap_or(&ident);
+                let name = info
+                    .attrs
+                    .rename
+                    .as_ref()
+                    .map(|(name, _)| name.clone())
+                    .or_else(|| info.attrs.split_names[side].clone())
+                    .unwrap_or_else(|| {
+                        rename_field(name, group.attrs.rename_rules[side].as_deref())
+                    });
+                if let Some(entry) = entries.iter().find(|entry| entry.name == name) {
+                    return Err(syn::Error::new(info.field.span(), format!(
+                        "field `{name}` must declare #[cbor(key = {})] consistently across enum variants", entry.key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// Serde's field rename rules (field names start in snake_case).
+fn rename_field(name: &str, rule: Option<&str>) -> String {
+    match rule {
+        Some("UPPERCASE" | "SCREAMING_SNAKE_CASE") => name.to_ascii_uppercase(),
+        Some("kebab-case") => name.replace('_', "-"),
+        Some("SCREAMING-KEBAB-CASE") => name.to_ascii_uppercase().replace('_', "-"),
+        Some("PascalCase" | "camelCase") => {
+            let mut out = String::new();
+            let mut capitalize = true;
+            for ch in name.chars() {
+                if ch == '_' {
+                    capitalize = true;
+                } else if capitalize {
+                    out.push(ch.to_ascii_uppercase());
+                    capitalize = false;
+                } else {
+                    out.push(ch);
+                }
+            }
+            if rule == Some("camelCase") {
+                if let Some(first) = out.get_mut(..1) {
+                    first.make_ascii_lowercase();
+                }
+            }
+            out
+        }
+        _ => name.to_owned(),
+    }
+}
+
 // Reads the `#[cbor(key = ...)]` field attributes into key table entries
 // under the fields' serde names.
-fn field_entries(fields: &syn::Fields) -> syn::Result<Vec<Entry>> {
+fn field_entries(fields: &[FieldInfo<'_>]) -> syn::Result<Vec<Entry>> {
     let mut entries = Vec::new();
 
-    for field in fields {
+    for info in fields {
+        let field = info.field;
         let mut key: Option<KeyArg> = None;
         for attr in &field.attrs {
             if !attr.path().is_ident("cbor") {
@@ -896,7 +969,7 @@ fn field_entries(fields: &syn::Fields) -> syn::Result<Vec<Entry>> {
                 ));
             }
         }
-        let serde = scan_serde(&field.attrs);
+        let serde = &info.attrs;
         if let (Some(..), Some(span)) = (&key, serde.flatten) {
             return Err(syn::Error::new(
                 span,
@@ -942,8 +1015,8 @@ fn field_entries(fields: &syn::Fields) -> syn::Result<Vec<Entry>> {
 
         // The key table is consulted with the field's *serde* name, so an
         // explicit rename carries over.
-        let name = match serde.rename {
-            Some((name, _)) => name,
+        let name = match &serde.rename {
+            Some((name, _)) => name.clone(),
             None => {
                 let ident = field.ident.as_ref().expect("checked above").to_string();
                 ident.strip_prefix("r#").unwrap_or(&ident).to_string()
@@ -967,10 +1040,35 @@ fn field_entries(fields: &syn::Fields) -> syn::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-fn fields_have_flatten(fields: &syn::Fields) -> Option<proc_macro2::Span> {
+fn fields_have_flatten(fields: &[FieldInfo<'_>]) -> Option<proc_macro2::Span> {
     fields
         .iter()
-        .find_map(|field| scan_serde(&field.attrs).flatten)
+        .find_map(|field| field.attrs.flatten.filter(|_| field.attrs.skip.is_none()))
+}
+
+struct FieldInfo<'a> {
+    field: &'a syn::Field,
+    attrs: SerdeAttrs,
+}
+
+struct FieldGroup<'a> {
+    fields: Vec<FieldInfo<'a>>,
+    attrs: SerdeAttrs,
+}
+
+impl<'a> FieldGroup<'a> {
+    fn new(fields: &'a syn::Fields, attrs: SerdeAttrs) -> Self {
+        Self {
+            fields: fields
+                .iter()
+                .map(|field| FieldInfo {
+                    field,
+                    attrs: scan_serde(&field.attrs),
+                })
+                .collect(),
+            attrs,
+        }
+    }
 }
 
 // The serde attribute metas the marker must coordinate with.
@@ -978,9 +1076,12 @@ fn fields_have_flatten(fields: &syn::Fields) -> Option<proc_macro2::Span> {
 struct SerdeAttrs {
     rename: Option<(String, proc_macro2::Span)>,
     split_rename: Option<proc_macro2::Span>,
+    split_names: [Option<String>; 2],
     rename_all: Option<proc_macro2::Span>,
+    rename_rules: [Option<String>; 2],
     rename_all_fields: Option<proc_macro2::Span>,
     enum_repr: Option<proc_macro2::Span>,
+    tag: Option<proc_macro2::Span>,
     flatten: Option<proc_macro2::Span>,
     // Container shapes that bypass the container name — and with it the
     // marker carrying the declared tag, array shape and keys.
@@ -996,7 +1097,14 @@ struct SerdeAttrs {
     // `#[serde(skip)]`: the field is never on the wire in either direction.
     skip: Option<proc_macro2::Span>,
     positional_skip: Option<proc_macro2::Span>,
+    skip_serializing: bool,
+    skip_deserializing: bool,
+    serialize_with: bool,
+    deserialize_with: bool,
     default: bool,
+    default_path: bool,
+    // None: implicit borrowing only; Some(None): borrow all field lifetimes.
+    borrow: Option<Option<Vec<syn::Lifetime>>>,
     explicit_crate: bool,
 }
 
@@ -1008,56 +1116,6 @@ type BoundPredicates = syn::punctuated::Punctuated<syn::WherePredicate, syn::Tok
 fn parse_bound(lit: &syn::LitStr) -> Option<BoundPredicates> {
     lit.parse_with(syn::punctuated::Punctuated::parse_terminated)
         .ok()
-}
-
-// `syn::parse2` entry point for a where-predicate list.
-struct ParsedBound(BoundPredicates);
-
-impl Parse for ParsedBound {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        Ok(Self(syn::punctuated::Punctuated::parse_terminated(input)?))
-    }
-}
-
-// Replaces every `'de` in `tokens` with `to`. A lifetime is a joint `'`
-// punct followed by an ident; groups are walked recursively. Renaming is
-// uniform, so a `for<'de> ...` binder in a bound string stays consistent.
-fn rename_de_lifetime(tokens: TokenStream, to: &syn::Lifetime) -> TokenStream {
-    let from = syn::Lifetime::new("'de", proc_macro2::Span::call_site());
-    rename_lifetime(tokens, &from, to)
-}
-
-// Renames one lifetime token without touching longer user names that merely
-// share its prefix.
-fn rename_lifetime(tokens: TokenStream, from: &syn::Lifetime, to: &syn::Lifetime) -> TokenStream {
-    use proc_macro2::{Group, Spacing, TokenTree};
-
-    let mut out = TokenStream::new();
-    let mut iter = tokens.into_iter().peekable();
-    while let Some(token) = iter.next() {
-        match token {
-            TokenTree::Group(group) => {
-                let inner = rename_lifetime(group.stream(), from, to);
-                let mut renamed = Group::new(group.delimiter(), inner);
-                renamed.set_span(group.span());
-                out.extend([TokenTree::Group(renamed)]);
-            }
-            TokenTree::Punct(punct)
-                if punct.as_char() == '\'' && punct.spacing() == Spacing::Joint =>
-            {
-                match iter.peek() {
-                    Some(TokenTree::Ident(ident)) if ident == &from.ident => {
-                        iter.next();
-                        out.extend(quote!(#to));
-                    }
-                    _ => out.extend([TokenTree::Punct(punct)]),
-                }
-            }
-            other => out.extend([other]),
-        }
-    }
-
-    out
 }
 
 // Scans `#[serde(...)]` attributes, tolerating any meta shapes we do not
@@ -1084,8 +1142,33 @@ fn scan_serde(attrs: &[syn::Attribute]) -> SerdeAttrs {
                     return Ok(());
                 }
                 out.split_rename = Some(meta.path.span());
+                meta.parse_nested_meta(|side| {
+                    let name: syn::LitStr = side.value()?.parse()?;
+                    if side.path.is_ident("serialize") {
+                        out.split_names[0] = Some(name.value());
+                    } else if side.path.is_ident("deserialize") {
+                        out.split_names[1] = Some(name.value());
+                    }
+                    Ok(())
+                })?;
+                return Ok(());
             } else if meta.path.is_ident("rename_all") {
                 out.rename_all = Some(meta.path.span());
+                if meta.input.peek(syn::Token![=]) {
+                    let rule: syn::LitStr = meta.value()?.parse()?;
+                    out.rename_rules = [Some(rule.value()), Some(rule.value())];
+                } else {
+                    meta.parse_nested_meta(|side| {
+                        let rule: syn::LitStr = side.value()?.parse()?;
+                        if side.path.is_ident("serialize") {
+                            out.rename_rules[0] = Some(rule.value());
+                        } else if side.path.is_ident("deserialize") {
+                            out.rename_rules[1] = Some(rule.value());
+                        }
+                        Ok(())
+                    })?;
+                }
+                return Ok(());
             } else if meta.path.is_ident("rename_all_fields") {
                 out.rename_all_fields = Some(meta.path.span());
             } else if meta.path.is_ident("flatten") {
@@ -1135,6 +1218,24 @@ fn scan_serde(attrs: &[syn::Attribute]) -> SerdeAttrs {
                 return Ok(());
             } else if meta.path.is_ident("default") {
                 out.default = !meta.input.peek(syn::Token![=]);
+                out.default_path = !out.default;
+            } else if meta.path.is_ident("borrow") {
+                out.borrow = Some(if meta.input.peek(syn::Token![=]) {
+                    let lit: syn::LitStr = meta.value()?.parse()?;
+                    Some(lit.parse_with(
+                        syn::punctuated::Punctuated::<syn::Lifetime, syn::Token![+]>::parse_terminated,
+                    )?.into_iter().collect())
+                } else {
+                    None
+                });
+                return Ok(());
+            } else if meta.path.is_ident("with") {
+                out.serialize_with = true;
+                out.deserialize_with = true;
+            } else if meta.path.is_ident("serialize_with") {
+                out.serialize_with = true;
+            } else if meta.path.is_ident("deserialize_with") {
+                out.deserialize_with = true;
             } else if meta.path.is_ident("crate") {
                 out.explicit_crate = true;
             } else if meta.path.is_ident("skip_serializing")
@@ -1142,13 +1243,20 @@ fn scan_serde(attrs: &[syn::Attribute]) -> SerdeAttrs {
                 || meta.path.is_ident("skip_serializing_if")
             {
                 out.positional_skip = Some(meta.path.span());
+                out.skip_serializing |= meta.path.is_ident("skip_serializing");
+                out.skip_deserializing |= meta.path.is_ident("skip_deserializing");
             } else if meta.path.is_ident("skip") {
                 out.skip = Some(meta.path.span());
+                out.skip_serializing = true;
+                out.skip_deserializing = true;
             } else if meta.path.is_ident("tag")
                 || meta.path.is_ident("untagged")
                 || meta.path.is_ident("content")
             {
                 out.enum_repr = Some(meta.path.span());
+                if meta.path.is_ident("tag") {
+                    out.tag = Some(meta.path.span());
+                }
             }
 
             if meta.input.peek(syn::token::Paren) {
@@ -1167,663 +1275,4 @@ fn scan_serde(attrs: &[syn::Attribute]) -> SerdeAttrs {
 }
 
 #[cfg(test)]
-mod tests {
-    use quote::quote;
-
-    use super::*;
-
-    fn expanded(item: TokenStream) -> String {
-        expand(item).unwrap().to_string()
-    }
-
-    fn error(item: TokenStream) -> String {
-        expand(item).unwrap_err().to_string()
-    }
-
-    #[test]
-    fn generates_a_marked_remote_shadow() {
-        let out = expanded(quote! {
-            #[cbor(tag = 123)]
-            struct ProtectedHeader {
-                #[cbor(key = 1)]
-                alg: i8,
-                #[cbor(key = 4)]
-                #[serde(with = "serde_bytes")]
-                kid: Vec<u8>,
-                plain: bool,
-            }
-        });
-
-        assert!(
-            out.contains(r#"rename = "@@CBOR@@123@@alg=1;kid=4@@ProtectedHeader""#),
-            "{out}"
-        );
-        assert!(out.contains(r#"remote = "ProtectedHeader""#), "{out}");
-        assert!(out.contains(r#"with = "serde_bytes""#), "{out}");
-        assert!(
-            out.contains("impl :: cbor2 :: __serde :: Serialize for ProtectedHeader"),
-            "{out}"
-        );
-        assert!(
-            out.contains(
-                "impl < '__de > :: cbor2 :: __serde :: Deserialize < '__de > for ProtectedHeader"
-            ),
-            "{out}"
-        );
-        // The #[cbor(...)] attributes stay off the shadow.
-        assert!(!out.contains("# [cbor"), "{out}");
-
-        // The declared details surface through the cbor2::Cbor trait.
-        assert!(
-            out.contains("impl :: cbor2 :: Cbor for ProtectedHeader"),
-            "{out}"
-        );
-        assert!(
-            out.contains(r#"const KEYS : & 'static [(& 'static str , i128)] = & [("alg" , 1i128) , ("kid" , 4i128)] ;"#),
-            "{out}"
-        );
-        assert!(
-            out.contains(":: core :: option :: Option :: Some (123u64)"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn generates_plain_serde_impls_without_cbor_attributes() {
-        let out = expanded(quote! {
-            struct Plain {
-                a: u8,
-            }
-        });
-
-        assert!(!out.contains("@@CBOR@@"), "{out}");
-        assert!(out.contains(r#"remote = "Plain""#), "{out}");
-        assert!(
-            out.contains("impl :: cbor2 :: __serde :: Serialize for Plain"),
-            "{out}"
-        );
-
-        // The trait impl is still generated, with an empty table.
-        assert!(
-            out.contains(r#"const KEYS : & 'static [(& 'static str , i128)] = & [] ;"#),
-            "{out}"
-        );
-        assert!(out.contains(":: core :: option :: Option :: None"), "{out}");
-    }
-
-    #[test]
-    fn uses_the_serde_rename_as_the_key_table_name() {
-        let out = expanded(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                #[serde(rename = "alg", default)]
-                algorithm: i8,
-            }
-        });
-
-        assert!(out.contains(r#"rename = "@@CBOR@@@@alg=1@@S""#), "{out}");
-        assert!(out.contains(r#"rename = "alg""#), "{out}");
-        assert!(out.contains("default"), "{out}");
-    }
-
-    #[test]
-    fn supports_field_order_array_structs() {
-        let out = expanded(quote! {
-            #[cbor(tag = 18, array)]
-            struct Sign1 {
-                protected: Vec<u8>,
-                unprotected: u8,
-                payload: Vec<u8>,
-                signature: Vec<u8>,
-            }
-        });
-
-        assert!(
-            out.contains(r#"rename = "@@CBOR@@18@@@@array@@Sign1""#),
-            "{out}"
-        );
-        assert!(out.contains("const ARRAY : bool = true"), "{out}");
-        assert!(out.contains("impl :: cbor2 :: Cbor for Sign1"), "{out}");
-    }
-
-    #[test]
-    fn supports_flattened_map_structs() {
-        let out = expanded(quote! {
-            #[cbor(tag = 61)]
-            struct Claims {
-                #[cbor(key = 1)]
-                #[serde(rename = "iss")]
-                issuer: String,
-                #[serde(flatten)]
-                extra: BTreeMap<String, cbor2::Value>,
-            }
-        });
-
-        assert!(out.contains("flatten_serialize"), "{out}");
-        assert!(out.contains("flatten_deserialize"), "{out}");
-        assert!(
-            out.contains(r#"rename = "@@CBOR@@61@@iss=1@@Claims""#),
-            "{out}"
-        );
-        assert!(
-            out.contains(
-                r#"const KEYS : & 'static [(& 'static str , i128)] = & [("iss" , 1i128)] ;"#
-            ),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn strips_raw_identifier_prefixes() {
-        let out = expanded(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                r#type: u8,
-            }
-        });
-
-        assert!(out.contains(r#"rename = "@@CBOR@@@@type=1@@S""#), "{out}");
-    }
-
-    #[test]
-    fn merges_enum_variant_fields() {
-        let out = expanded(quote! {
-            enum Message {
-                Signed {
-                    #[cbor(key = 1)]
-                    payload: u8,
-                },
-                Verified {
-                    #[cbor(key = 1)]
-                    payload: u8,
-                    #[cbor(key = 2)]
-                    peer: u8,
-                },
-                Unit,
-            }
-        });
-
-        assert!(
-            out.contains(r#"rename = "@@CBOR@@@@payload=1;peer=2@@Message""#),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn keeps_generics_and_their_bounds() {
-        let out = expanded(quote! {
-            #[cbor(tag = 7)]
-            struct Wrap<T: Clone> {
-                #[cbor(key = 1)]
-                inner: T,
-            }
-        });
-
-        assert!(out.contains(r#"remote = "Wrap""#), "{out}");
-        assert!(
-            out.contains(
-                "impl < T : Clone + :: cbor2 :: __serde :: Serialize > :: cbor2 :: __serde :: Serialize for Wrap < T >"
-            ),
-            "{out}"
-        );
-        assert!(
-            out.contains(
-                "impl < '__de , T : Clone + :: cbor2 :: __serde :: Deserialize < '__de > >"
-            ),
-            "{out}"
-        );
-        // The trait impl carries the original generics, without serde bounds.
-        assert!(
-            out.contains("impl < T : Clone > :: cbor2 :: Cbor for Wrap < T >"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn avoids_deserialize_lifetime_collisions() {
-        let out = expanded(quote! {
-            struct Borrowed<'a, '__de> {
-                #[cbor(key = 1)]
-                value: &'a str,
-                other: &'__de str,
-            }
-        });
-
-        assert!(
-            out.contains(
-                "impl < '__de_ : 'a + '__de , 'a , '__de > :: cbor2 :: __serde :: Deserialize < '__de_ > for Borrowed < 'a , '__de >"
-            ),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn rejects_user_lifetime_named_de() {
-        let msg = error(quote! {
-            struct Borrowed<'de> {
-                value: &'de str,
-            }
-        });
-
-        assert!(msg.contains("lifetime named 'de"), "{msg}");
-    }
-
-    #[test]
-    fn accepts_the_full_integer_ranges() {
-        let out = expanded(quote! {
-            #[cbor(tag = 18446744073709551615)]
-            struct Edges {
-                #[cbor(key = 0)]
-                zero: u8,
-                #[cbor(key = 18446744073709551615)]
-                hi: u8,
-                #[cbor(key = -18446744073709551616)]
-                lo: u8,
-            }
-        });
-
-        assert!(
-            out.contains(
-                r#"rename = "@@CBOR@@18446744073709551615@@zero=0;hi=18446744073709551615;lo=-18446744073709551616@@Edges""#
-            ),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_uses() {
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 18446744073709551616)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("must fit a CBOR integer"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(tag = 18446744073709551616)]
-            struct S;
-        });
-        assert!(msg.contains("must fit a CBOR tag"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(tag = -1)]
-            struct S;
-        });
-        assert!(msg.contains("must fit a CBOR tag"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(tag = 1)]
-            #[cbor(tag = 2)]
-            struct S;
-        });
-        assert!(msg.contains("duplicate #[cbor(tag = ...)]"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(tag = 1)]
-            enum E { A }
-        });
-        assert!(msg.contains("not supported on enums"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(array)]
-            enum E { A }
-        });
-        assert!(msg.contains("`array` is not supported on enums"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(array)]
-            struct S(u8);
-        });
-        assert!(msg.contains("requires a struct with named fields"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(array)]
-            struct S {
-                #[cbor(key = 1)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("cannot be used with #[cbor(array)]"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(array)]
-            struct S {
-                a: u8,
-                #[serde(flatten)]
-                extra: BTreeMap<String, u8>,
-            }
-        });
-        assert!(msg.contains("cannot be used with #[cbor(array)]"), "{msg}");
-
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                #[cbor(key = 2)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("duplicate #[cbor(key = ...)]"), "{msg}");
-
-        let msg = error(quote! {
-            struct S(#[cbor(key = 1)] u8);
-        });
-        assert!(msg.contains("named field"), "{msg}");
-
-        let msg = error(quote! {
-            struct S {
-                #[cbor(name = 1)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("expected `key = <integer>`"), "{msg}");
-
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                a: u8,
-                #[cbor(key = 9)]
-                #[serde(flatten)]
-                extra: BTreeMap<String, u8>,
-            }
-        });
-        assert!(msg.contains("cannot be combined with #[cbor(key"), "{msg}");
-
-        let msg = error(quote! {
-            enum E {
-                A {
-                    #[serde(flatten)]
-                    extra: BTreeMap<String, u8>,
-                },
-            }
-        });
-        assert!(msg.contains("supported only on structs"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(key = 1)]
-            struct S {
-                a: u8,
-            }
-        });
-        assert!(msg.contains("expected `tag = <integer>`"), "{msg}");
-
-        let msg = error(quote! {
-            union U { a: u8 }
-        });
-        assert!(msg.contains("supports structs and enums"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(tag = 1, foo)]
-            struct S {
-                a: u8,
-            }
-        });
-        assert!(
-            msg.contains("expected `tag = <integer>` or `array`"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn copies_lint_attributes_to_the_shadow() {
-        let out = expanded(quote! {
-            #[allow(non_snake_case)]
-            struct S {
-                #[cbor(key = 1)]
-                #[allow(unused)]
-                fooBar: u8,
-            }
-        });
-
-        // Both the container-level and the field-level allow survive on the
-        // shadow, which repeats the user's names.
-        assert!(out.contains("allow (non_snake_case)"), "{out}");
-        assert!(out.contains("allow (unused)"), "{out}");
-    }
-
-    #[test]
-    fn rejects_suffixed_integer_literals() {
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 1u8)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("suffixed integer literal"), "{msg}");
-
-        let msg = error(quote! {
-            #[cbor(tag = 7u64)]
-            struct S {
-                a: u8,
-            }
-        });
-        assert!(msg.contains("suffixed integer literal"), "{msg}");
-    }
-
-    #[test]
-    fn oversized_key_literals_report_the_cbor_range() {
-        // Beyond i128: the parse itself fails, but the error still names
-        // the CBOR range instead of a generic overflow.
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 170141183460469231731687303715884105728)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("must fit a CBOR integer"), "{msg}");
-    }
-
-    #[test]
-    fn rejects_container_shapes_that_bypass_the_marker() {
-        let msg = error(quote! {
-            #[serde(transparent)]
-            #[cbor(tag = 7)]
-            struct S {
-                a: u8,
-            }
-        });
-        assert!(msg.contains("silently ignored"), "{msg}");
-
-        let msg = error(quote! {
-            #[serde(into = "Other")]
-            struct S {
-                #[cbor(key = 1)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("silently ignored on encode"), "{msg}");
-
-        let msg = error(quote! {
-            #[serde(from = "Other")]
-            #[cbor(tag = 7)]
-            struct S {
-                a: u8,
-            }
-        });
-        assert!(msg.contains("silently ignored on decode"), "{msg}");
-
-        let msg = error(quote! {
-            #[serde(try_from = "Other")]
-            struct S {
-                #[cbor(key = 1)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("silently ignored on decode"), "{msg}");
-
-        // Without any #[cbor(...)] details there is nothing to lose, so
-        // both shapes stay allowed.
-        let out = expanded(quote! {
-            #[serde(transparent)]
-            struct S {
-                a: u8,
-            }
-        });
-        assert!(out.contains("transparent"), "{out}");
-
-        let out = expanded(quote! {
-            #[serde(from = "Other")]
-            struct S {
-                a: u8,
-            }
-        });
-        assert!(out.contains("Other"), "{out}");
-    }
-
-    #[test]
-    fn container_bounds_replace_the_inferred_impl_bounds() {
-        // `bound = ""` erases the `T: Serialize` / `T: Deserialize<'de>`
-        // bounds on the outer impls, as it does on the shadow's impls.
-        let out = expanded(quote! {
-            #[serde(bound = "")]
-            struct S<T> {
-                #[cbor(key = 1)]
-                a: u8,
-                #[serde(skip)]
-                marker: PhantomData<T>,
-            }
-        });
-        assert!(
-            !out.contains("T : :: cbor2 :: __serde :: Serialize"),
-            "{out}"
-        );
-        assert!(
-            !out.contains("T : :: cbor2 :: __serde :: Deserialize"),
-            "{out}"
-        );
-
-        // Split bounds replace each direction separately, and `'de` in a
-        // deserialize bound is renamed to the impl's fresh lifetime.
-        let out = expanded(quote! {
-            #[serde(bound(deserialize = "T: ::serde::Deserialize<'de> + Default"))]
-            struct S<T> {
-                #[cbor(key = 1)]
-                a: T,
-            }
-        });
-        assert!(
-            out.contains("T : :: serde :: Deserialize < '__de > + Default"),
-            "{out}"
-        );
-        assert!(
-            out.contains("T : :: cbor2 :: __serde :: Serialize"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn rejects_key_on_fully_skipped_fields() {
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                #[serde(skip)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("never on the wire"), "{msg}");
-
-        // One-directional skips keep the key meaningful.
-        let out = expanded(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                #[serde(skip_serializing_if = "Option::is_none", default)]
-                a: Option<u8>,
-            }
-        });
-        assert!(out.contains(r#"rename = "@@CBOR@@@@a=1@@S""#), "{out}");
-
-        // A skipped field without a key stays fine.
-        let out = expanded(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                a: u8,
-                #[serde(skip)]
-                b: u8,
-            }
-        });
-        assert!(out.contains(r#"rename = "@@CBOR@@@@a=1@@S""#), "{out}");
-    }
-
-    #[test]
-    fn rejects_serde_conflicts() {
-        let msg = error(quote! {
-            #[serde(rename = "Other")]
-            struct S {
-                #[cbor(key = 1)]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("container-level #[serde(rename"), "{msg}");
-
-        let msg = error(quote! {
-            #[serde(rename_all = "camelCase")]
-            struct S {
-                #[cbor(key = 1)]
-                a_b: u8,
-            }
-        });
-        assert!(msg.contains("rename_all"), "{msg}");
-
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                #[serde(rename(serialize = "x", deserialize = "y"))]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("split serialize/deserialize renames"), "{msg}");
-
-        let msg = error(quote! {
-            #[serde(tag = "type")]
-            enum E {
-                A {
-                    #[cbor(key = 1)]
-                    a: u8,
-                },
-            }
-        });
-        assert!(msg.contains("externally tagged"), "{msg}");
-
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                a: u8,
-                #[cbor(key = 1)]
-                b: u8,
-            }
-        });
-        assert!(msg.contains("already mapped"), "{msg}");
-
-        let msg = error(quote! {
-            enum E {
-                A {
-                    #[cbor(key = 1)]
-                    x: u8,
-                },
-                B {
-                    #[cbor(key = 2)]
-                    x: u8,
-                },
-            }
-        });
-        assert!(msg.contains("conflicting keys"), "{msg}");
-
-        let msg = error(quote! {
-            enum E {
-                #[cbor(tag = 1)]
-                A,
-            }
-        });
-        assert!(msg.contains("not supported on enum variants"), "{msg}");
-
-        // A rename whose value would corrupt the marker grammar.
-        let msg = error(quote! {
-            struct S {
-                #[cbor(key = 1)]
-                #[serde(rename = "a=b")]
-                a: u8,
-            }
-        });
-        assert!(msg.contains("may not be empty or contain"), "{msg}");
-    }
-}
+mod tests;

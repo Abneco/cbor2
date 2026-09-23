@@ -355,6 +355,104 @@ fn container_serde_bounds_are_honored() {
 }
 
 #[test]
+fn shared_enum_keys_keep_variant_field_order_and_plain_names() {
+    #[derive(Debug, PartialEq, Cbor)]
+    enum Message {
+        First {
+            #[cbor(key = 1)]
+            a: u8,
+            #[cbor(key = 2)]
+            b: u8,
+        },
+        Second {
+            #[cbor(key = 2)]
+            b: u8,
+            note: u8,
+            #[cbor(key = 1)]
+            a: u8,
+            #[cbor(key = 3)]
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            extra: Option<u8>,
+        },
+    }
+    let message = Message::Second {
+        b: 2,
+        note: 3,
+        a: 1,
+        extra: None,
+    };
+    let bytes = cbor2::to_vec(&message).unwrap();
+    assert_eq!(
+        cbor2::diagnostic(&bytes[..]).unwrap(),
+        r#"{"Second": {2: 2, "note": 3, 1: 1}}"#
+    );
+    assert_eq!(cbor2::from_slice::<Message>(&bytes).unwrap(), message);
+    assert_eq!(
+        Value::serialized(&message)
+            .unwrap()
+            .deserialized::<Message>()
+            .unwrap(),
+        message
+    );
+
+    // An untagged variant remains supported when no CBOR key table is used.
+    #[derive(Debug, PartialEq, Cbor)]
+    enum Plain {
+        Unit,
+        #[serde(untagged)]
+        Number(u8),
+    }
+    assert_eq!(cbor2::from_slice::<Plain>(&[7]).unwrap(), Plain::Number(7));
+}
+
+#[test]
+fn plain_struct_tags_use_the_original_type_name() {
+    #[derive(Debug, PartialEq, Cbor)]
+    #[serde(tag = "kind")]
+    struct Message {
+        value: u8,
+    }
+    let message = Message { value: 7 };
+    assert_eq!(
+        serde_json::to_string(&message).unwrap(),
+        r#"{"kind":"Message","value":7}"#
+    );
+    let bytes = cbor2::to_vec(&message).unwrap();
+    assert_eq!(cbor2::from_slice::<Message>(&bytes).unwrap(), message);
+}
+
+#[test]
+fn flattening_inner_structs_uses_serde_names() {
+    #[derive(Debug, PartialEq, Cbor)]
+    struct Inner {
+        #[cbor(key = 1)]
+        value: u8,
+    }
+    #[derive(Debug, PartialEq, Cbor)]
+    struct Outer {
+        #[serde(flatten)]
+        inner: Inner,
+    }
+    let value = Outer {
+        inner: Inner { value: 7 },
+    };
+    let bytes = cbor2::to_vec(&value).unwrap();
+    assert_eq!(cbor2::diagnostic(&bytes[..]).unwrap(), r#"{"value": 7}"#);
+    assert_eq!(cbor2::from_slice::<Outer>(&bytes).unwrap(), value);
+    assert_eq!(
+        Value::serialized(&value)
+            .unwrap()
+            .deserialized::<Outer>()
+            .unwrap(),
+        value
+    );
+    assert!(cbor2::from_slice::<Outer>(&[0xa1, 1, 7])
+        .unwrap_err()
+        .to_string()
+        .contains("missing field"));
+}
+
+#[test]
 fn full_key_range() {
     #[derive(Debug, PartialEq, Cbor)]
     #[cbor(tag = 18446744073709551615)]

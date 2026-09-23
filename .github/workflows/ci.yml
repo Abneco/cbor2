@@ -83,6 +83,8 @@ jobs:
       - run: cargo build --no-default-features ${{ matrix.feature_args }} --target thumbv7em-none-eabihf
       - run: cargo test --lib --no-default-features ${{ matrix.feature_args }}
       - run: cargo clippy --no-default-features ${{ matrix.feature_args }} -- -Dwarnings
+      - if: matrix.name == 'alloc,derive'
+        run: cargo check --manifest-path tests/derive-fixtures/Cargo.toml --lib --no-default-features --target thumbv7em-none-eabihf
 
   lint:
     name: rustfmt and clippy

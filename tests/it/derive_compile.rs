@@ -9,8 +9,16 @@ fn derive_consumer_fixtures() {
     let target = root.join("target/derive-fixtures");
     for (binary, expected_error) in [
         ("pass", None),
+        ("bounds", None),
         ("array_skip", Some("array field positions")),
         ("tuple_skip", Some("array field positions")),
+        (
+            "enum_key_conflict",
+            Some("consistently across enum variants"),
+        ),
+        ("enum_untagged", Some("untagged variants are not supported")),
+        ("struct_tag", Some("on a struct conflicts with")),
+        ("array_tag", Some("on a struct conflicts with")),
     ] {
         let output = Command::new(env!("CARGO"))
             .args([
@@ -38,4 +46,23 @@ fn derive_consumer_fixtures() {
             assert!(output.status.success(), "{binary}: {diagnostic}");
         }
     }
+
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "check",
+            "--offline",
+            "--lib",
+            "--no-default-features",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target)
+        .output()
+        .expect("cargo is available to check no_std consumers");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

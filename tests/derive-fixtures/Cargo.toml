@@ -6,8 +6,15 @@ publish = false
 
 [workspace]
 
+[features]
+default = ["std"]
+std = ["cbor2/std"]
+
+[lib]
+path = "no_std.rs"
+
 [dependencies]
-cbor2 = { path = "../..", features = ["derive"] }
+cbor2 = { path = "../..", default-features = false, features = ["alloc", "derive"] }
 
 [[bin]]
 name = "pass"
@@ -20,3 +27,23 @@ path = "array_skip.rs"
 [[bin]]
 name = "tuple_skip"
 path = "tuple_skip.rs"
+
+[[bin]]
+name = "bounds"
+path = "bounds.rs"
+
+[[bin]]
+name = "enum_key_conflict"
+path = "enum_key_conflict.rs"
+
+[[bin]]
+name = "enum_untagged"
+path = "enum_untagged.rs"
+
+[[bin]]
+name = "struct_tag"
+path = "struct_tag.rs"
+
+[[bin]]
+name = "array_tag"
+path = "array_tag.rs"

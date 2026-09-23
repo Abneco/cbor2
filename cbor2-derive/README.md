@@ -113,6 +113,17 @@ and support borrowed fields when decoding from a slice. The binary flatten
 adapter uses cbor2's raw-item protocol; other binary serializers are not
 supported. Human-readable formats keep the ordinary serde representation.
 
+Flattening an inner struct uses serde's field names; it does not inherit the
+inner type's `Cbor::KEYS`, tag or array shape. Declare registered keys on the
+outer struct and use a flattened map for extension labels. For example,
+flattening an `Inner { #[cbor(key = 1)] value: u8 }` field writes `"value"`,
+not integer `1`.
+
+An enum's key table is shared by its variants. Repeated serde field names
+must consistently declare the same integer key. Enums with integer keys
+cannot contain `#[serde(untagged)]` variants. On structs, `#[serde(tag =
+"...")]` cannot be combined with CBOR keys, tags or array shape.
+
 ## License
 
 Licensed under the MIT License.

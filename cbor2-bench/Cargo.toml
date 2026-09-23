@@ -66,6 +66,10 @@ harness = false
 name = "focused"
 harness = false
 
+[[bench]]
+name = "derive"
+harness = false
+
 # Optimize the comparison the way a release build would.
 [profile.bench]
 lto = "thin"

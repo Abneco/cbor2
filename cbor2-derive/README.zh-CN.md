@@ -95,6 +95,10 @@ struct Claims {
 
 flatten 结构体中已声明的 RawValue 字段保留原始编码，切片解码支持借用字段。二进制 flatten 适配器使用 cbor2 的原始条目协议，不支持其他二进制序列化器；可读格式仍使用普通 serde 表示。
 
+将内层结构体 flatten 到外层时，使用的是 serde 字段名，不会继承内层类型的 `Cbor::KEYS`、tag 或 array 形状。请在外层结构体声明注册整数键，并使用扁平化 map 承载扩展标签。例如，flatten 一个包含 `#[cbor(key = 1)] value: u8` 的内层结构体，输出的键仍是文本 `"value"`。
+
+枚举的各个变体共用一张键表，因此重复出现的 serde 字段名必须一致地声明相同整数键。具有整数键的枚举不能包含 `#[serde(untagged)]` 变体。结构体上的 `#[serde(tag = "...")]` 不能与 CBOR 整数键、tag 或 array 形状组合使用。
+
 ## 许可协议
 
 采用 MIT 许可协议。

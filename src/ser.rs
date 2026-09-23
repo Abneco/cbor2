@@ -156,15 +156,21 @@ pub(crate) fn parse_struct_marker(name: &str) -> Option<StructMarker<'_>> {
     Some(StructMarker { tag, keys, shape })
 }
 
-// The integer map key for a struct field, if the key table names it.
+// Search for the field name directly instead of splitting every preceding
+// entry at both delimiters. Boundary checks preserve first-valid-entry
+// semantics even for hand-written markers with duplicate or invalid entries.
+#[inline]
 pub(crate) fn key_for_field(keys: &str, field: &str) -> Option<i128> {
-    keys.split(';').find_map(|entry| {
-        let (name, key) = entry.split_once('=')?;
-        if name == field {
-            canonical_int(key)
-        } else {
-            None
+    if field.contains([';', '=']) {
+        return None;
+    }
+    keys.match_indices(field).find_map(|(start, _)| {
+        if start != 0 && keys.as_bytes()[start - 1] != b';' {
+            return None;
         }
+        let rest = keys[start + field.len()..].strip_prefix('=')?;
+        let decimal = rest.split_once(';').map_or(rest, |(key, _)| key);
+        canonical_int(decimal)
     })
 }
 
@@ -1029,6 +1035,26 @@ pub fn to_canonical_vec_with<T: ?Sized + ser::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_key_search_matches_whole_names_and_first_valid_entries() {
+        let keys = "wrong=a=100;x=bad;x=2;x=3;pré=-4;a=5;aa=6;empty=;=9;eq=name=7";
+        for (name, expected) in [
+            ("x", Some(2)),
+            ("pré", Some(-4)),
+            ("a", Some(5)),
+            ("aa", Some(6)),
+            ("", Some(9)),
+            ("wrong", None),
+            ("empty", None),
+            ("eq", None),
+            ("eq=name", None),
+            ("a;aa", None),
+            ("missing", None),
+        ] {
+            assert_eq!(key_for_field(keys, name), expected, "{name}");
+        }
+    }
 
     #[test]
     fn byte_counter_is_a_well_behaved_sink() {

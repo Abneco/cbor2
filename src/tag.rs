@@ -314,13 +314,11 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for &mut TagAccess<D> 
     fn deserialize_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         self.state += 1;
 
-        match self.state {
-            1 => visitor.visit_str(match self.tag {
-                Some(..) => TAGGED,
-                None => UNTAGGED,
-            }),
-
-            _ => visitor.visit_u64(self.tag.unwrap()),
+        match (self.state, self.tag) {
+            (1, Some(..)) => visitor.visit_str(TAGGED),
+            (1, None) => visitor.visit_str(UNTAGGED),
+            (_, Some(tag)) => visitor.visit_u64(tag),
+            (_, None) => Err(de::Error::custom("expected tag")),
         }
     }
 
@@ -433,14 +431,6 @@ impl ser::Serializer for TagNumberSerializer {
     type Ok = u64;
     type Error = NotATag;
 
-    type SerializeSeq = ser::Impossible<u64, NotATag>;
-    type SerializeTuple = ser::Impossible<u64, NotATag>;
-    type SerializeTupleStruct = ser::Impossible<u64, NotATag>;
-    type SerializeTupleVariant = ser::Impossible<u64, NotATag>;
-    type SerializeMap = ser::Impossible<u64, NotATag>;
-    type SerializeStruct = ser::Impossible<u64, NotATag>;
-    type SerializeStructVariant = ser::Impossible<u64, NotATag>;
-
     #[inline]
     fn serialize_u8(self, v: u8) -> Result<u64, NotATag> {
         Ok(v.into())
@@ -461,149 +451,20 @@ impl ser::Serializer for TagNumberSerializer {
         Ok(v)
     }
 
-    // Without alloc, serde provides no default for `collect_str`; a
-    // formatted string is never a tag number either way.
-    fn collect_str<T: ?Sized + core::fmt::Display>(self, _: &T) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_bool(self, _: bool) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_i8(self, _: i8) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_i16(self, _: i16) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_i32(self, _: i32) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_i64(self, _: i64) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_i128(self, _: i128) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_u128(self, _: u128) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_f32(self, _: f32) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_f64(self, _: f64) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_char(self, _: char) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_str(self, _: &str) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_bytes(self, _: &[u8]) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_none(self) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_some<U: ?Sized + ser::Serialize>(self, _: &U) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_unit(self) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_unit_struct(self, _: &'static str) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_unit_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-    ) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_newtype_struct<U: ?Sized + ser::Serialize>(
-        self,
-        _: &'static str,
-        _: &U,
-    ) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_newtype_variant<U: ?Sized + ser::Serialize>(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: &U,
-    ) -> Result<u64, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeTupleStruct, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeTupleVariant, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self::SerializeStruct, NotATag> {
-        Err(NotATag)
-    }
-
-    fn serialize_struct_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeStructVariant, NotATag> {
-        Err(NotATag)
-    }
-
-    fn is_human_readable(&self) -> bool {
-        false
+    crate::ser::reject_serializer! {
+        NotATag;
+        serialize_bool(bool),
+        serialize_i8(i8),
+        serialize_i16(i16),
+        serialize_i32(i32),
+        serialize_i64(i64),
+        serialize_i128(i128),
+        serialize_u128(u128),
+        serialize_f32(f32),
+        serialize_f64(f64),
+        serialize_char(char),
+        serialize_str(&str),
+        serialize_bytes(&[u8]),
     }
 }
 
@@ -760,6 +621,36 @@ mod tests {
         let access = TagAccess::new(StrDeserializer::<DeError>::new("x"), Some(1));
         let (_, variant) = de::EnumAccess::variant::<String>(access).unwrap();
         variant.tuple_variant(2, BoolFirst).unwrap();
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn untagged_access_has_no_tag_number() {
+        // Reading a tag number from untagged input is an error, not a panic.
+        let access = TagAccess::new(StrDeserializer::<DeError>::new("x"), None);
+        let (name, variant) = de::EnumAccess::variant::<String>(access).unwrap();
+        assert_eq!(name, UNTAGGED);
+
+        struct TagNumber;
+
+        impl<'de> Visitor<'de> for TagNumber {
+            type Value = Option<u64>;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "a tag number")
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut acc: A) -> Result<Self::Value, A::Error> {
+                acc.next_element()
+            }
+        }
+
+        assert_eq!(
+            format!("{}", &TagNumber as &dyn de::Expected),
+            "a tag number"
+        );
+        let err = variant.tuple_variant(2, TagNumber).unwrap_err();
+        assert_eq!(err.to_string(), "expected tag");
     }
 
     #[cfg(feature = "alloc")]

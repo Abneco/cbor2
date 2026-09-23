@@ -9,6 +9,10 @@
 //! Enable the `futures` or `tokio` crate features to use the adapters in the
 //! `async_io::futures` or `async_io::tokio` modules.
 //!
+//! Each header takes one or two small `read_exact` calls, so wrap an
+//! unbuffered socket in a buffered reader (such as `tokio::io::BufReader`)
+//! to avoid a system call per header.
+//!
 //! The item walk is iterative, so the futures returned here are plain state
 //! machines: when the reader or writer is `Send`, so is the future, and it
 //! can be driven by multi-threaded executors such as `tokio::spawn`.
@@ -487,7 +491,6 @@ async fn read_body<R: AsyncRead + ?Sized>(
     // through a separate buffer first.
     while remaining > 0 {
         let n = remaining.min(CHUNK);
-        check_size_limit(*offset, n, max_len)?;
         let used = out.len();
         out.resize(used + n, 0);
         reader

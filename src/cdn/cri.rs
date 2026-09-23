@@ -2,10 +2,11 @@ use alloc::{string::String, vec::Vec};
 
 use crate::de::Error;
 
-use super::encode::{write_array_len, write_definite_bytes, write_definite_text, write_tag};
+use super::encode::{
+    write_array_len, write_definite_bytes, write_definite_text, write_int, write_tag,
+};
 use super::ip::{parse_ipv4, parse_ipv6};
-use super::parser::Parser;
-use super::types::{Atom, BigInt, Indicator, CRI_TAG};
+use super::types::{Atom, Indicator, CRI_TAG};
 
 pub(super) fn cri_atom(content: &str, tagged: bool, offset: usize) -> Result<Atom, Error> {
     let iri = iref::IriRef::new(content)
@@ -34,7 +35,7 @@ fn cri_reference_bytes(iri: &iref::IriRef, offset: usize) -> Result<Vec<u8>, Err
         }
         None => {
             if let Some(authority) = iri.authority() {
-                sections.push(write_simple_value(22)?);
+                sections.push(write_simple_value(22));
                 sections.push(cri_authority_bytes(authority, offset)?);
             } else {
                 sections.push(cri_discard_bytes(iri.path().as_str()));
@@ -53,7 +54,7 @@ fn cri_reference_bytes(iri: &iref::IriRef, offset: usize) -> Result<Vec<u8>, Err
             PercentContext::Fragment,
             offset,
         )?)?,
-        None => write_simple_value(22)?,
+        None => write_simple_value(22),
     });
 
     trim_cri_defaults(&mut sections);
@@ -78,7 +79,7 @@ fn trim_cri_defaults(sections: &mut Vec<Vec<u8>>) {
 fn cri_scheme_bytes(scheme: &str) -> Result<Vec<u8>, Error> {
     let lower = scheme.to_ascii_lowercase();
     if let Some(number) = cri_scheme_number(&lower) {
-        write_i128(-1 - i128::from(number))
+        Ok(write_i128(-1 - i128::from(number)))
     } else {
         cri_text_bytes(&lower)
     }
@@ -102,26 +103,26 @@ fn cri_scheme_number(scheme: &str) -> Option<u64> {
 
 fn cri_no_authority_bytes(path: &str) -> Vec<u8> {
     if path.is_empty() || path.starts_with('/') {
-        write_simple_value(22).expect("null is encodable")
+        write_simple_value(22)
     } else {
-        write_simple_value(21).expect("true is encodable")
+        write_simple_value(21)
     }
 }
 
 fn cri_discard_bytes(path: &str) -> Vec<u8> {
     if path.starts_with('/') {
-        write_simple_value(21).expect("true is encodable")
+        write_simple_value(21)
     } else if path.is_empty() {
-        write_i128(0).expect("zero is encodable")
+        write_i128(0)
     } else {
-        write_i128(1).expect("one is encodable")
+        write_i128(1)
     }
 }
 
 fn cri_authority_bytes(authority: &iref::iri::Authority, offset: usize) -> Result<Vec<u8>, Error> {
     let mut items = Vec::new();
     if let Some(user_info) = authority.user_info() {
-        items.push(write_simple_value(20)?);
+        items.push(write_simple_value(20));
         items.push(cri_text_bytes(&percent_decode_component(
             user_info.as_str(),
             PercentContext::UserInfo,
@@ -150,7 +151,7 @@ fn cri_authority_bytes(authority: &iref::iri::Authority, offset: usize) -> Resul
             .as_str()
             .parse::<u16>()
             .map_err(|_| Error::semantic(offset, "CRI port must fit in u16"))?;
-        items.push(write_i128(i128::from(n))?);
+        items.push(write_i128(i128::from(n)));
     }
 
     let mut out = Vec::new();
@@ -238,16 +239,16 @@ fn write_empty_array() -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-fn write_simple_value(value: u8) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::new();
-    Parser::new("").write_simple(&mut out, value, Indicator::None)?;
-    Ok(out)
+// CRI only uses the one-byte simple values false, true and null.
+fn write_simple_value(value: u8) -> Vec<u8> {
+    debug_assert!(value <= 23);
+    alloc::vec![0xe0 | value]
 }
 
-fn write_i128(value: i128) -> Result<Vec<u8>, Error> {
+fn write_i128(value: i128) -> Vec<u8> {
     let mut out = Vec::new();
-    Parser::new("").write_integer(&mut out, &BigInt::from_i128(value), Indicator::None)?;
-    Ok(out)
+    write_int(&mut out, value);
+    out
 }
 
 #[derive(Clone, Copy)]

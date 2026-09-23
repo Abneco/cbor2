@@ -8,6 +8,17 @@
   unit, Option and unit enum variants, while preserving the generic Simple form.
 * Report CDN application-extension evaluation errors at the source argument's
   opening delimiter, including escaped, computed and CR-normalized arguments.
+* Decode `char` from readers with the same error kinds as from slices: a
+  multi-character text is an invalid type, not a syntax error.
+* Return an error instead of panicking when a tag number is requested from
+  untagged tag-protocol input.
+
+### Features
+
+* Add `Deserializer::into_iter` for slice deserializers: CBOR sequences held
+  in memory decode with borrowing and the slice fast paths, and iteration
+  stops after the first error.
+* `RawValue::deserialized` can borrow text and byte strings from the raw item.
 
 ### Performance
 
@@ -15,10 +26,21 @@
 * Format indefinite maps without per-entry strings, avoid redundant canonical
   key sorting in the ordinary bytewise case, and decode hex literals directly
   into bytes without a nibble buffer.
-* Add allocation regressions and focused benchmarks; retain the existing array
-  capacity heuristic after comparing smaller reservation strategies.
+* Add allocation regressions and focused benchmarks.
 * Simplify infallible internal helpers and document compatibility entry points
   still required by older derive releases.
+* Dispatch `deserialize_any` directly on the pulled header instead of pushing
+  it back, so `Value`, untagged enums and flattened structs reach the slice
+  fast paths; reader `&str` decoding reuses the scratch buffer.
+* Keep the four-bytes-per-element array capacity hint for short arrays, but cap
+  it at 4 KiB beyond one byte per element: large arrays of one-byte items no
+  longer reserve four times their encoded size, and interleaved runs of the
+  capacity workloads showed no slowdown for wide or struct elements.
+* Encode `to_canonical_writer*` in one pass, look up integer field keys by
+  their canonical decimal text, skip the key table scan for unmarked structs
+  and format short `collect_str` output once on the stack.
+* Share the slice header argument reads, the CDN list and container parsing,
+  and one rejecting serializer for internal tag, simple and raw extractors.
 
 ## [1.1.5] - 2026-09-06
 

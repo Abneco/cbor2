@@ -93,6 +93,134 @@ impl ser::Error for Error {
     }
 }
 
+// Completes the `Serializer` impl of an internal extractor (a tag number, a
+// simple value, raw bytes): every compound form, `collect_str` and the listed
+// scalar methods fail with `$err`. The impl defines the accepted methods.
+macro_rules! reject_serializer {
+    ($err:expr; $($method:ident($ty:ty)),* $(,)?) => {
+        type SerializeSeq = serde::ser::Impossible<Self::Ok, Self::Error>;
+        type SerializeTuple = serde::ser::Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleStruct = serde::ser::Impossible<Self::Ok, Self::Error>;
+        type SerializeTupleVariant = serde::ser::Impossible<Self::Ok, Self::Error>;
+        type SerializeMap = serde::ser::Impossible<Self::Ok, Self::Error>;
+        type SerializeStruct = serde::ser::Impossible<Self::Ok, Self::Error>;
+        type SerializeStructVariant = serde::ser::Impossible<Self::Ok, Self::Error>;
+
+        $(fn $method(self, _: $ty) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        })*
+
+        // Without alloc, serde provides no default for `collect_str`; a
+        // formatted string is never accepted either way.
+        fn collect_str<U: ?Sized + core::fmt::Display>(
+            self,
+            _: &U,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_some<U: ?Sized + serde::Serialize>(
+            self,
+            _: &U,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_unit_struct(self, _: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_newtype_struct<U: ?Sized + serde::Serialize>(
+            self,
+            _: &'static str,
+            _: &U,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_newtype_variant<U: ?Sized + serde::Serialize>(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: &U,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err($err)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err($err)
+        }
+
+        fn is_human_readable(&self) -> bool {
+            false
+        }
+    };
+}
+
+pub(crate) use reject_serializer;
+
 /// The marker prefix that carries a struct's CBOR protocol details.
 ///
 /// CBOR protocols like COSE (RFC 9052) key their maps with integers and
@@ -161,7 +289,7 @@ pub(crate) fn parse_struct_marker(name: &str) -> Option<StructMarker<'_>> {
 // semantics even for hand-written markers with duplicate or invalid entries.
 #[inline]
 pub(crate) fn key_for_field(keys: &str, field: &str) -> Option<i128> {
-    if field.contains([';', '=']) {
+    if keys.is_empty() || field.contains([';', '=']) {
         return None;
     }
     keys.match_indices(field).find_map(|(start, _)| {
@@ -176,12 +304,45 @@ pub(crate) fn key_for_field(keys: &str, field: &str) -> Option<i128> {
 
 // The struct field name for an integer map key, if the key table maps it.
 // Only the (alloc-gated) deserializers translate keys in this direction.
+//
+// Only canonical decimals are valid entries, and a key has exactly one
+// canonical spelling, so rendering the key once and comparing text matches
+// the same entries as parsing every entry would.
 #[cfg(feature = "alloc")]
 pub(crate) fn field_for_key(keys: &str, key: i128) -> Option<&str> {
+    let mut buffer = [0u8; 40];
+    let decimal = decimal(key, &mut buffer);
     keys.split(';').find_map(|entry| {
         let (name, k) = entry.split_once('=')?;
-        (canonical_int(k)? == key).then_some(name)
+        (k.as_bytes() == decimal).then_some(name)
     })
+}
+
+// Writes the canonical decimal form of `value` to the end of `buffer`.
+#[cfg(feature = "alloc")]
+fn decimal(value: i128, buffer: &mut [u8; 40]) -> &[u8] {
+    let mut start = buffer.len();
+    let mut wide = value.unsigned_abs();
+    // Only -2^64 exceeds u64 among CBOR integers; keep the digits in u64.
+    while wide > u128::from(u64::MAX) {
+        start -= 1;
+        buffer[start] = b'0' + (wide % 10) as u8;
+        wide /= 10;
+    }
+    let mut rest = wide as u64;
+    loop {
+        start -= 1;
+        buffer[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        start -= 1;
+        buffer[start] = b'-';
+    }
+    &buffer[start..]
 }
 
 // Parses a canonical decimal in the CBOR integer range: no leading
@@ -456,8 +617,13 @@ impl<'a, W: Write> ser::Serializer for &'a mut Serializer<W> {
 
     #[inline]
     fn serialize_seq(self, length: Option<usize>) -> Result<Self::SerializeSeq, Error> {
+        // Four bytes per element avoids regrowth for typical small arrays;
+        // past ~1365 elements the hint overshoots by at most 4 KiB, so a
+        // large array of one-byte items no longer reserves four times its
+        // encoded size.
         if let Some(length) = length {
-            self.0.reserve(length.saturating_mul(4).saturating_add(9));
+            let hint = length.saturating_mul(4).min(length.saturating_add(4096));
+            self.0.reserve(hint.saturating_add(9));
         }
         self.0.array(length)?;
         Ok(CollectionSerializer {
@@ -585,11 +751,36 @@ impl<'a, W: Write> ser::Serializer for &'a mut Serializer<W> {
         })
     }
 
-    // The default implementation buffers the formatted output in a String;
-    // formatting twice (once to measure the text header, once to stream the
-    // body) avoids the allocation.
+    // The default implementation buffers the formatted output in a String.
+    // Short output (timestamps, identifiers, numbers) is formatted once into
+    // a stack buffer; longer output is formatted twice — once to measure the
+    // text header, once to stream the body — which avoids the allocation.
     fn collect_str<T: ?Sized + core::fmt::Display>(self, value: &T) -> Result<(), Error> {
         use core::fmt::Write as _;
+
+        struct Stack {
+            bytes: [u8; 64],
+            len: usize,
+        }
+
+        impl core::fmt::Write for Stack {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let end = self.len + s.len();
+                let slot = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+                slot.copy_from_slice(s.as_bytes());
+                self.len = end;
+                Ok(())
+            }
+        }
+
+        let mut stack = Stack {
+            bytes: [0; 64],
+            len: 0,
+        };
+        if write!(&mut stack, "{value}").is_ok() {
+            self.0.push_len(3, Some(stack.len))?;
+            return Ok(self.0.write_all(&stack.bytes[..stack.len])?);
+        }
 
         struct Counter(usize);
 
@@ -1005,16 +1196,18 @@ pub fn to_canonical_vec<T: ?Sized + ser::Serialize>(value: &T) -> Result<Vec<u8>
 /// [`Value`](crate::Value) in order to sort map keys, so this is more
 /// expensive than [`to_writer`].
 ///
-/// Maps with duplicate keys (after normalization) are rejected.
+/// Maps with duplicate keys (after normalization) are rejected before
+/// anything is written.
 #[cfg(feature = "alloc")]
 pub fn to_canonical_writer_with<T: ?Sized + ser::Serialize, W: Write>(
     value: &T,
-    writer: W,
+    mut writer: W,
     order: KeyOrder,
 ) -> Result<(), Error> {
-    let mut value = crate::value::Value::serialized(value)?;
-    value.canonicalize_with(order)?;
-    to_writer(&value, writer)
+    // Encoding in one pass into a buffer keeps a failed map from leaving
+    // partial output, without canonicalizing the Value tree in place first.
+    let bytes = to_canonical_vec_with(value, order)?;
+    Ok(writer.write_all(&bytes)?)
 }
 
 /// Serializes a value as deterministically encoded CBOR into a new
@@ -1054,6 +1247,19 @@ mod tests {
         ] {
             assert_eq!(key_for_field(keys, name), expected, "{name}");
         }
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn field_lookup_matches_canonical_entries_only() {
+        let keys = "a=01;b=-0;c=+3;d=3;e=-18446744073709551616;f=18446744073709551615;g=-7;h=0";
+        assert_eq!(field_for_key(keys, 1), None);
+        assert_eq!(field_for_key(keys, 3), Some("d"));
+        assert_eq!(field_for_key(keys, 0), Some("h"));
+        assert_eq!(field_for_key(keys, -7), Some("g"));
+        assert_eq!(field_for_key(keys, -(1i128 << 64)), Some("e"));
+        assert_eq!(field_for_key(keys, u64::MAX.into()), Some("f"));
+        assert_eq!(field_for_key("", 0), None);
     }
 
     #[test]

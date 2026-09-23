@@ -15,6 +15,15 @@ struct ArrayRecord {
     enabled: bool,
 }
 
+// Serializes through `collect_str`, like chrono and other Display-based types.
+struct Displayed(u64);
+
+impl serde::Serialize for Displayed {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
 fn review(c: &mut Criterion) {
     let array = Value::Array((0..1024u64).map(Value::from).collect());
     c.bench_function("review/value_array", |b| {
@@ -41,6 +50,64 @@ fn review(c: &mut Criterion) {
     let map = Value::Map((0..1024u64).rev().map(|n| (n.into(), n.into())).collect());
     c.bench_function("review/canonical_map", |b| {
         b.iter(|| cbor2::to_canonical_vec(black_box(&map)).unwrap())
+    });
+    c.bench_function("review/canonical_writer", |b| {
+        let mut out = Vec::new();
+        b.iter(|| {
+            out.clear();
+            cbor2::to_canonical_writer(black_box(&map), &mut out).unwrap();
+            black_box(&out);
+        })
+    });
+    let records: Vec<_> = (0..1024u64)
+        .map(|id| ArrayRecord { id, enabled: true })
+        .collect();
+    c.bench_function("review/canonical_struct", |b| {
+        b.iter(|| cbor2::to_canonical_vec(black_box(&records)).unwrap())
+    });
+
+    let entries: Vec<_> = (0..256u64)
+        .map(|n| {
+            cbor2::cbor!({
+                "id": n,
+                "level": "info",
+                "message": "request completed",
+                "ok": true,
+                "ratio": 0.5,
+                "tags": ["api", "v1"],
+            })
+            .unwrap()
+        })
+        .collect();
+    let bytes = cbor2::to_vec(&entries).unwrap();
+    c.bench_function("review/value_decode", |b| {
+        b.iter(|| cbor2::from_slice::<Value>(black_box(&bytes)).unwrap())
+    });
+
+    let displayed: Vec<_> = (0..1024u64).map(|n| Displayed(n * 7919)).collect();
+    c.bench_function("review/collect_str", |b| {
+        b.iter(|| cbor2::to_vec(black_box(&displayed)).unwrap())
+    });
+
+    let mut sequence = Vec::new();
+    for n in 0..1024u64 {
+        cbor2::to_writer(&(n * 65537), &mut sequence).unwrap();
+    }
+    c.bench_function("review/sequence_reader", |b| {
+        b.iter(|| {
+            cbor2::de::Deserializer::from_reader(black_box(sequence.as_slice()))
+                .into_iter::<u64>()
+                .map(Result::unwrap)
+                .sum::<u64>()
+        })
+    });
+    c.bench_function("review/sequence_slice", |b| {
+        b.iter(|| {
+            cbor2::de::Deserializer::from_slice(black_box(sequence.as_slice()))
+                .into_iter::<u64>()
+                .map(Result::unwrap)
+                .sum::<u64>()
+        })
     });
 
     let mut group = c.benchmark_group("review/array_encode");

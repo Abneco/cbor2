@@ -33,52 +33,43 @@ pub(super) fn ip_atom(content: &str, tagged: bool, offset: usize) -> Result<Atom
         IpAddr::V6(bytes) => (54, 128, bytes.to_vec()),
     };
 
-    let raw = if let Some(prefix) = prefix {
-        if prefix > max_prefix {
-            return Err(Error::semantic(offset, "IP prefix length is out of range"));
-        }
-        // RFC 9164 §4.2 requires the bits beyond the prefix length to be
-        // zero. Rejecting nonzero host bits — instead of silently masking
-        // them off — keeps the literal faithful to the encoded data.
-        let mut prefix_bytes = mask_prefix(bytes.clone(), prefix);
-        if bytes[..prefix_bytes.len()] != prefix_bytes[..]
-            || bytes[prefix_bytes.len()..].iter().any(|&b| b != 0)
-        {
-            return Err(Error::semantic(
-                offset,
-                "IP prefix has nonzero bits beyond the prefix length",
-            ));
-        }
-        while prefix_bytes.last() == Some(&0) {
-            prefix_bytes.pop();
-        }
-        let mut array = Vec::new();
-        write_uint(&mut array, 4, 2, Indicator::None)
+    let mut out = Vec::new();
+    if tagged {
+        write_uint(&mut out, 6, tag_number, Indicator::None)
             .map_err(|msg| Error::semantic(offset, msg))?;
-        write_uint(&mut array, 0, u64::from(prefix), Indicator::None)
-            .map_err(|msg| Error::semantic(offset, msg))?;
-        write_definite_bytes(&mut array, &prefix_bytes, Indicator::None)?;
-        array
-    } else {
-        let mut out = Vec::new();
-        write_definite_bytes(&mut out, &bytes, Indicator::None)?;
+    }
+
+    let Some(prefix) = prefix else {
         if !tagged {
             return Ok(Atom::Bytes(bytes));
         }
-        out
+        write_definite_bytes(&mut out, &bytes, Indicator::None)?;
+        return Ok(Atom::Raw(out));
     };
 
-    if tagged {
-        let mut out = Vec::new();
-        write_uint(&mut out, 6, tag_number, Indicator::None)
-            .map_err(|msg| Error::semantic(offset, msg))?;
-        out.extend_from_slice(&raw);
-        Ok(Atom::Raw(out))
-    } else if prefix.is_some() {
-        Ok(Atom::Raw(raw))
-    } else {
-        unreachable!()
+    if prefix > max_prefix {
+        return Err(Error::semantic(offset, "IP prefix length is out of range"));
     }
+    // RFC 9164 §4.2 requires the bits beyond the prefix length to be zero.
+    // Rejecting nonzero host bits — instead of silently masking them off —
+    // keeps the literal faithful to the encoded data.
+    let mut prefix_bytes = mask_prefix(bytes.clone(), prefix);
+    if bytes[..prefix_bytes.len()] != prefix_bytes[..]
+        || bytes[prefix_bytes.len()..].iter().any(|&b| b != 0)
+    {
+        return Err(Error::semantic(
+            offset,
+            "IP prefix has nonzero bits beyond the prefix length",
+        ));
+    }
+    while prefix_bytes.last() == Some(&0) {
+        prefix_bytes.pop();
+    }
+    write_uint(&mut out, 4, 2, Indicator::None).map_err(|msg| Error::semantic(offset, msg))?;
+    write_uint(&mut out, 0, u64::from(prefix), Indicator::None)
+        .map_err(|msg| Error::semantic(offset, msg))?;
+    write_definite_bytes(&mut out, &prefix_bytes, Indicator::None)?;
+    Ok(Atom::Raw(out))
 }
 
 enum IpAddr {

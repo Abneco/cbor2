@@ -493,14 +493,11 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
 
     fn deserialize_tuple_struct<V: de::Visitor<'de>>(
         self,
-        name: &'static str,
+        _name: &'static str,
         _len: usize,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        match unwrap_struct_tag(name, self.0) {
-            Some(value) => self.nested(value).deserialize_seq(visitor),
-            None => self.deserialize_seq(visitor),
-        }
+        self.deserialize_seq(visitor)
     }
 
     fn deserialize_identifier<V: de::Visitor<'de>>(
@@ -577,13 +574,10 @@ impl<'de> de::Deserializer<'de> for Deserializer<&Value> {
     #[inline]
     fn deserialize_unit_struct<V: de::Visitor<'de>>(
         self,
-        name: &'static str,
+        _name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        match unwrap_struct_tag(name, self.0) {
-            Some(value) => self.nested(value).deserialize_unit(visitor),
-            None => self.deserialize_unit(visitor),
-        }
+        self.deserialize_unit(visitor)
     }
 
     #[inline]
@@ -776,8 +770,10 @@ impl<'a, 'de, T: Iterator<Item = &'a (Value, Value)>> de::MapAccess<'de>
     }
 }
 
-// Walks the tag layers of a tagged marked struct's value. Returns `None` —
-// keep the value and the default handling — for unmarked or untagged structs.
+// Walks the tag layers of a tagged marked newtype struct's value, whose inner
+// type may not skip tags itself; every other struct form unwraps them. Returns
+// `None` — keep the value and the default handling — for unmarked or untagged
+// structs.
 fn unwrap_struct_tag<'x>(name: &'static str, mut value: &'x Value) -> Option<&'x Value> {
     let Some(crate::ser::StructMarker { tag: Some(..), .. }) =
         crate::ser::parse_struct_marker(name)

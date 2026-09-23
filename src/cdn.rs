@@ -57,7 +57,6 @@ mod types;
 /// let bytes = cbor2::cdn_to_vec(r#"{ /kty/ 1: 4, "kid": h'deadbeef' }"#).unwrap();
 /// assert_eq!(cbor2::to_cdn(&bytes[..]).unwrap(), r#"{1: 4, "kid": h'deadbeef'}"#);
 /// ```
-#[cfg(feature = "alloc")]
 pub fn cdn_to_vec(input: &str) -> Result<Vec<u8>, Error> {
     parser::item_to_vec(input)
 }
@@ -67,7 +66,6 @@ pub fn cdn_to_vec(input: &str) -> Result<Vec<u8>, Error> {
 /// Top-level items may be separated by commas or by blank space/comments.
 /// This is the same sequence grammar used inside CDN's `<<..>>` embedded
 /// CBOR literals, but without wrapping the result as a byte string.
-#[cfg(feature = "alloc")]
 pub fn cdn_sequence_to_vec(input: &str) -> Result<Vec<u8>, Error> {
     parser::sequence_to_vec(input)
 }
@@ -105,7 +103,6 @@ fn check_input_limit(input: &str, max_len: usize) -> Result<(), Error> {
 /// text is first encoded into owned CBOR bytes. Use [`cdn_to_vec`] and
 /// then [`from_slice`](crate::from_slice) directly when you need control over
 /// the encoded bytes.
-#[cfg(feature = "alloc")]
 pub fn from_cdn<T>(input: &str) -> Result<T, Error>
 where
     T: DeserializeOwned,

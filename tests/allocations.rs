@@ -118,3 +118,18 @@ fn pretty_indefinite_map_only_allocates_output() {
     assert_eq!(actual.replacen("{_", "{", 1), expected);
     assert_eq!(counts.0, definite_counts.0);
 }
+
+#[test]
+fn large_arrays_of_one_byte_items_do_not_overreserve() {
+    // The per-element capacity hint is capped for long arrays, so the
+    // buffer stays within a few KiB of the encoding instead of four times.
+    for len in [10_000usize, 100_000] {
+        let bytes = cbor2::to_vec(&vec![true; len]).unwrap();
+        assert!(bytes.len() > len);
+        assert!(
+            bytes.capacity() <= bytes.len() + 4096 + 9,
+            "{len}: {}",
+            bytes.capacity()
+        );
+    }
+}

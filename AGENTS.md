@@ -36,7 +36,7 @@ feature is the most common compile failure — set the manifest first.
 | Decode from an in-memory buffer | `cbor2::from_slice` | `from_reader` if borrowed fields are expected |
 | Decode from `Read` | `cbor2::from_reader` | Borrowed output types |
 | Require exactly one item in a buffer | `cbor2::validate_slice` before/after decode (`validate` for readers) | Assuming `from_slice` rejects trailing bytes |
-| Decode a CBOR sequence | `cbor2::de::Deserializer::into_iter` | Repeated `from_slice` on the same buffer |
+| Decode a CBOR sequence | `cbor2::de::Deserializer::from_slice(bytes).into_iter()` (`from_reader` for streams) | Repeated `from_slice` on the same buffer |
 | Preserve exact encoded bytes | `cbor2::RawValue` | Decode/re-encode through typed structs |
 | Dynamic or unknown shape | `cbor2::Value` or `cbor2::cbor!` | Untyped maps of JSON strings |
 | Preserve CBOR simple values | `cbor2::Simple` or `Value::Simple` | Collapsing registered simple values into ad hoc integers |

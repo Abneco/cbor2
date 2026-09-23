@@ -63,6 +63,16 @@ fn derive(c: &mut Criterion) {
     encode(c, "derive/keyed16", &keyed);
     encode(c, "derive/flatten16", &flat);
     encode(c, "derive/direct16", &direct);
+
+    // Integer keys translate back to field names through the marker table.
+    let bytes = cbor2::to_vec(&keyed).unwrap();
+    c.bench_function("derive/keyed16_decode", |b| {
+        b.iter(|| cbor2::from_slice::<Keyed16>(black_box(&bytes)).unwrap())
+    });
+    let value = cbor2::Value::serialized(&keyed).unwrap();
+    c.bench_function("derive/keyed16_value_decode", |b| {
+        b.iter(|| black_box(&value).deserialized::<Keyed16>().unwrap())
+    });
 }
 
 criterion_group!(benches, derive);

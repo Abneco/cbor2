@@ -218,13 +218,13 @@ let mut stream = Vec::new();
 cbor2::to_writer(&"hello", &mut stream).unwrap();
 cbor2::to_writer(&42u64, &mut stream).unwrap();
 
-let items: Vec<cbor2::Value> = cbor2::de::Deserializer::from_reader(&stream[..])
+let items: Vec<cbor2::Value> = cbor2::de::Deserializer::from_slice(&stream)
     .into_iter()
     .collect::<Result<_, _>>()
     .unwrap();
 
 assert_eq!(items, vec![cbor2::Value::from("hello"), cbor2::Value::from(42)]);
-assert!(cbor2::validate(&stream[..]).is_err()); // not exactly one item
+assert!(cbor2::validate_slice(&stream).is_err()); // not exactly one item
 ```
 
 # Async Item I/O

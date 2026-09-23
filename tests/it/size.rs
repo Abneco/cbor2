@@ -224,21 +224,34 @@ impl Serialize for FailingDisplay {
     }
 }
 
+// Longer than the single-pass stack buffer, so after the attempted stack
+// pass the output is measured and then streamed in two more passes.
+const LONG: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef!";
+const LONGER: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef!!!";
+
 #[test]
 fn misbehaving_display_is_rejected() {
     // Grows between the measuring and the writing pass.
-    let grow = Shifty(std::cell::Cell::new(0), &["ab", "abcd"]);
+    let grow = Shifty(std::cell::Cell::new(0), &[LONG, LONG, LONGER]);
     assert!(matches!(
         cbor2::to_vec(&grow),
         Err(cbor2::ser::Error::Value(..))
     ));
 
     // Shrinks between the passes.
-    let shrink = Shifty(std::cell::Cell::new(0), &["abcd", "ab"]);
+    let shrink = Shifty(std::cell::Cell::new(0), &[LONGER, LONGER, LONG]);
     assert!(matches!(
         cbor2::to_vec(&shrink),
         Err(cbor2::ser::Error::Value(..))
     ));
+
+    // Short output is formatted exactly once, so it cannot disagree.
+    let short = Shifty(std::cell::Cell::new(0), &["ab", "abcd"]);
+    assert_eq!(
+        cbor2::to_vec(&short).unwrap(),
+        cbor2::to_vec(&"ab").unwrap()
+    );
+    assert_eq!(short.0.get(), 1);
 
     // Fails outright.
     assert!(matches!(

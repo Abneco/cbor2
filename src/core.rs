@@ -668,6 +668,16 @@ impl Decoder<&[u8]> {
         crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof).into()
     }
 
+    // The `N` argument bytes that follow the prefix byte. Reading a constant
+    // width keeps every arm a fixed-size load.
+    #[inline(always)]
+    fn slice_arg<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        match self.reader.get(1..=N) {
+            Some(bytes) => Ok(bytes.try_into().expect("slice of length N")),
+            None => Err(self.slice_eof_after_prefix()),
+        }
+    }
+
     #[inline]
     fn finish_slice_header(&mut self, raw: [u8; 9], raw_len: u8) {
         #[cfg(feature = "alloc")]
@@ -687,6 +697,12 @@ impl Decoder<&[u8]> {
 
 #[cfg(feature = "alloc")]
 impl Decoder<&[u8]> {
+    /// Returns true when no input and no pushed-back header remain.
+    #[inline]
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.pushback.is_none() && self.reader.is_empty()
+    }
+
     /// Pulls a plain positive or negative integer from a byte slice.
     #[inline]
     pub(crate) fn integer_slice(&mut self) -> Option<Result<(bool, u64), Error>> {
@@ -703,57 +719,21 @@ impl Decoder<&[u8]> {
 
         self.mark = start;
 
-        let minor = first & 0b00011111;
-        let (value, raw_len) = match minor {
-            x @ 0..=23 => (u64::from(x), 1),
-            24 => {
-                if self.reader.len() < 2 {
-                    return Some(Err(self.slice_eof_after_prefix()));
-                }
-                (u64::from(self.reader[1]), 2)
-            }
-            25 => {
-                if self.reader.len() < 3 {
-                    return Some(Err(self.slice_eof_after_prefix()));
-                }
-                (
-                    u64::from(u16::from_be_bytes([self.reader[1], self.reader[2]])),
-                    3,
-                )
-            }
-            26 => {
-                if self.reader.len() < 5 {
-                    return Some(Err(self.slice_eof_after_prefix()));
-                }
-                (
-                    u64::from(u32::from_be_bytes([
-                        self.reader[1],
-                        self.reader[2],
-                        self.reader[3],
-                        self.reader[4],
-                    ])),
-                    5,
-                )
-            }
-            27 => {
-                if self.reader.len() < 9 {
-                    return Some(Err(self.slice_eof_after_prefix()));
-                }
-                (
-                    u64::from_be_bytes([
-                        self.reader[1],
-                        self.reader[2],
-                        self.reader[3],
-                        self.reader[4],
-                        self.reader[5],
-                        self.reader[6],
-                        self.reader[7],
-                        self.reader[8],
-                    ]),
-                    9,
-                )
-            }
-            _ => return Some(Err(Error::Syntax(start))),
+        let parsed = match first & 0b00011111 {
+            x @ 0..=23 => Ok((u64::from(x), 1)),
+            24 => self.slice_arg::<1>().map(|b| (u64::from(b[0]), 2)),
+            25 => self
+                .slice_arg::<2>()
+                .map(|b| (u64::from(u16::from_be_bytes(b)), 3)),
+            26 => self
+                .slice_arg::<4>()
+                .map(|b| (u64::from(u32::from_be_bytes(b)), 5)),
+            27 => self.slice_arg::<8>().map(|b| (u64::from_be_bytes(b), 9)),
+            _ => Err(Error::Syntax(start)),
+        };
+        let (value, raw_len) = match parsed {
+            Ok(parsed) => parsed,
+            Err(err) => return Some(Err(err)),
         };
 
         self.reader = &self.reader[raw_len as usize..];
@@ -788,49 +768,21 @@ impl Decoder<&[u8]> {
 
         let start = self.offset;
         let first = *self.reader.first()?;
-        let (value, raw_len) = match first {
-            0xf9 => {
-                if self.reader.len() < 3 {
-                    return Some(Err(self.slice_eof_after_prefix()));
-                }
-                (
-                    f16_to_f64(u16::from_be_bytes([self.reader[1], self.reader[2]])),
-                    3,
-                )
-            }
-            0xfa => {
-                if self.reader.len() < 5 {
-                    return Some(Err(self.slice_eof_after_prefix()));
-                }
-                (
-                    f32_to_f64(u32::from_be_bytes([
-                        self.reader[1],
-                        self.reader[2],
-                        self.reader[3],
-                        self.reader[4],
-                    ])),
-                    5,
-                )
-            }
-            0xfb => {
-                if self.reader.len() < 9 {
-                    return Some(Err(self.slice_eof_after_prefix()));
-                }
-                (
-                    f64::from_bits(u64::from_be_bytes([
-                        self.reader[1],
-                        self.reader[2],
-                        self.reader[3],
-                        self.reader[4],
-                        self.reader[5],
-                        self.reader[6],
-                        self.reader[7],
-                        self.reader[8],
-                    ])),
-                    9,
-                )
-            }
+        let parsed = match first {
+            0xf9 => self
+                .slice_arg::<2>()
+                .map(|b| (f16_to_f64(u16::from_be_bytes(b)), 3)),
+            0xfa => self
+                .slice_arg::<4>()
+                .map(|b| (f32_to_f64(u32::from_be_bytes(b)), 5)),
+            0xfb => self
+                .slice_arg::<8>()
+                .map(|b| (f64::from_bits(u64::from_be_bytes(b)), 9)),
             _ => return None,
+        };
+        let (value, raw_len) = match parsed {
+            Ok(parsed) => parsed,
+            Err(err) => return Some(Err(err)),
         };
 
         self.mark = start;
@@ -859,57 +811,27 @@ impl<'de> Decoder<&'de [u8]> {
 
         let mut raw = [0u8; 9];
         raw[0] = self.reader[0];
-        let minor = raw[0] & 0b00011111;
-        let (arg, raw_len) = match minor {
+        let (arg, raw_len) = match raw[0] & 0b00011111 {
             x @ 0..=23 => (Some(u64::from(x)), 1),
             24 => {
-                if self.reader.len() < 2 {
-                    return Err(self.slice_eof_after_prefix());
-                }
-                raw[1] = self.reader[1];
-                (Some(u64::from(raw[1])), 2)
+                let b = self.slice_arg::<1>()?;
+                raw[1] = b[0];
+                (Some(u64::from(b[0])), 2)
             }
             25 => {
-                if self.reader.len() < 3 {
-                    return Err(self.slice_eof_after_prefix());
-                }
-                raw[1] = self.reader[1];
-                raw[2] = self.reader[2];
-                (Some(u64::from(u16::from_be_bytes([raw[1], raw[2]]))), 3)
+                let b = self.slice_arg::<2>()?;
+                raw[1..3].copy_from_slice(&b);
+                (Some(u64::from(u16::from_be_bytes(b))), 3)
             }
             26 => {
-                if self.reader.len() < 5 {
-                    return Err(self.slice_eof_after_prefix());
-                }
-                raw[1] = self.reader[1];
-                raw[2] = self.reader[2];
-                raw[3] = self.reader[3];
-                raw[4] = self.reader[4];
-                (
-                    Some(u64::from(u32::from_be_bytes([
-                        raw[1], raw[2], raw[3], raw[4],
-                    ]))),
-                    5,
-                )
+                let b = self.slice_arg::<4>()?;
+                raw[1..5].copy_from_slice(&b);
+                (Some(u64::from(u32::from_be_bytes(b))), 5)
             }
             27 => {
-                if self.reader.len() < 9 {
-                    return Err(self.slice_eof_after_prefix());
-                }
-                raw[1] = self.reader[1];
-                raw[2] = self.reader[2];
-                raw[3] = self.reader[3];
-                raw[4] = self.reader[4];
-                raw[5] = self.reader[5];
-                raw[6] = self.reader[6];
-                raw[7] = self.reader[7];
-                raw[8] = self.reader[8];
-                (
-                    Some(u64::from_be_bytes([
-                        raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8],
-                    ])),
-                    9,
-                )
+                let b = self.slice_arg::<8>()?;
+                raw[1..9].copy_from_slice(&b);
+                (Some(u64::from_be_bytes(b)), 9)
             }
             31 => (None, 1),
             _ => return Err(Error::Syntax(start)),

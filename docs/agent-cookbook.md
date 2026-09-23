@@ -11,8 +11,8 @@ then gives the correct `cbor2` shape and the mistake to avoid.
 | Serialize to a writer | `cbor2::to_writer(&value, writer)` |
 | Deserialize from bytes | `cbor2::from_slice::<T>(bytes)` |
 | Deserialize from `Read` | `cbor2::from_reader::<T, _>(reader)` |
-| Validate exactly one item | `cbor2::validate(bytes)` |
-| Read adjacent CBOR items | `cbor2::de::Deserializer::from_reader(reader).into_iter()` |
+| Validate exactly one item | `cbor2::validate_slice(bytes)` (`validate(reader)` for readers) |
+| Read adjacent CBOR items | `cbor2::de::Deserializer::from_slice(bytes).into_iter()` (`from_reader` for readers) |
 | Preserve one raw item | `cbor2::RawValue` |
 | Work with unknown data | `cbor2::Value` or `cbor2::cbor!` |
 | Preserve CBOR simple values | `cbor2::Simple` or `Value::Simple` |
@@ -47,19 +47,20 @@ let _value: cbor2::Value = cbor2::from_slice(bytes).unwrap();
 
 ## Decode a CBOR Sequence
 
-CBOR sequences are adjacent complete items. Use the deserializer iterator.
+CBOR sequences are adjacent complete items. Use the deserializer iterator;
+the slice form can borrow from the buffer and stops after the first error.
 
 ```rust
 let mut stream = Vec::new();
 cbor2::to_writer(&"start", &mut stream).unwrap();
 cbor2::to_writer(&42u8, &mut stream).unwrap();
 
-let items: Vec<cbor2::Value> = cbor2::de::Deserializer::from_reader(&stream[..])
+let items: Vec<cbor2::Value> = cbor2::de::Deserializer::from_slice(&stream)
     .into_iter()
     .collect::<Result<_, _>>()
     .unwrap();
 assert_eq!(items.len(), 2);
-assert!(cbor2::validate(&stream[..]).is_err());
+assert!(cbor2::validate_slice(&stream).is_err());
 ```
 
 ## Encode CDN Fixtures

@@ -139,7 +139,7 @@ impl<'a> Parser<'a> {
 
         loop {
             let before = self.pos;
-            while matches!(self.peek(), Some('\t' | '\n' | '\r' | ' ')) {
+            while matches!(self.peek(), Some('\t' | '\n' | ' ')) {
                 self.bump();
             }
 
@@ -209,43 +209,41 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // Finishes one list entry: an optional comma, then `close` (end of input
+    // for `None`). Returns true once the list is closed; open entries must be
+    // separated by a comma or by blank space and comments.
+    fn list_end(&mut self, close: Option<&str>) -> Result<bool, Error> {
+        let spaced = self.consume_ws()?;
+        let comma = self.eat(",");
+        if comma {
+            self.skip_ws()?;
+        }
+        let closed = match close {
+            Some(close) => self.eat(close),
+            None => self.eof(),
+        };
+        if closed || comma || spaced {
+            Ok(closed)
+        } else {
+            Err(self.syntax())
+        }
+    }
+
     fn sequence_to_vec(&mut self, end: Option<&str>, depth: usize) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         self.skip_ws()?;
-        if let Some(end) = end {
-            if self.eat(end) {
-                return Ok(out);
-            }
-        } else if self.eof() {
-            return Ok(out);
-        }
-
-        loop {
-            self.item(&mut out, depth)?;
-            let had_ws = self.consume_ws()?;
-            if self.eat(",") {
-                self.skip_ws()?;
-                if let Some(end) = end {
-                    if self.eat(end) {
-                        break;
-                    }
-                } else if self.eof() {
+        let empty = match end {
+            Some(end) => self.eat(end),
+            None => self.eof(),
+        };
+        if !empty {
+            loop {
+                self.item(&mut out, depth)?;
+                if self.list_end(end)? {
                     break;
                 }
-                continue;
-            }
-            if let Some(end) = end {
-                if self.eat(end) {
-                    break;
-                }
-            } else if self.eof() {
-                break;
-            }
-            if !had_ws {
-                return Err(self.syntax());
             }
         }
-
         Ok(out)
     }
 
@@ -253,31 +251,16 @@ impl<'a> Parser<'a> {
         self.expect("<<")?;
         let mut args = Vec::new();
         self.skip_ws()?;
-        if self.eat(">>") {
-            return Ok(args);
-        }
-
-        loop {
-            let mut encoded = Vec::new();
-            self.item(&mut encoded, depth)?;
-            args.push(Arg::Encoded(encoded));
-
-            let had_ws = self.consume_ws()?;
-            if self.eat(",") {
-                self.skip_ws()?;
-                if self.eat(">>") {
+        if !self.eat(">>") {
+            loop {
+                let mut encoded = Vec::new();
+                self.item(&mut encoded, depth)?;
+                args.push(Arg::Encoded(encoded));
+                if self.list_end(Some(">>"))? {
                     break;
                 }
-                continue;
-            }
-            if self.eat(">>") {
-                break;
-            }
-            if !had_ws {
-                return Err(self.syntax());
             }
         }
-
         Ok(args)
     }
 
@@ -333,71 +316,29 @@ impl<'a> Parser<'a> {
 
     fn array(&mut self, out: &mut Vec<u8>, depth: usize) -> Result<(), Error> {
         self.expect("[")?;
-        let spec = self.parse_spec();
-        let spaced = self.consume_ws()?;
-        if spec != Indicator::None && !spaced && !matches!(self.peek(), Some(']' | '}')) {
-            return Err(self.syntax());
-        }
-
-        let indefinite = spec == Indicator::Indefinite;
-        if indefinite {
-            out.push(0x9f);
-            if self.eat("]") {
-                out.push(0xff);
-                return Ok(());
-            }
-
-            loop {
-                self.item(out, depth)?;
-                let had_ws = self.consume_ws()?;
-                if self.eat(",") {
-                    self.skip_ws()?;
-                    if self.eat("]") {
-                        out.push(0xff);
-                        return Ok(());
-                    }
-                    continue;
-                }
-                if self.eat("]") {
-                    out.push(0xff);
-                    return Ok(());
-                }
-                if !had_ws {
-                    return Err(self.syntax());
-                }
-            }
-        }
-
-        let mut body = Vec::new();
-        let mut count = 0usize;
-        if !self.eat("]") {
-            loop {
-                self.item(&mut body, depth)?;
-                count += 1;
-                let had_ws = self.consume_ws()?;
-                if self.eat(",") {
-                    self.skip_ws()?;
-                    if self.eat("]") {
-                        break;
-                    }
-                    continue;
-                }
-                if self.eat("]") {
-                    break;
-                }
-                if !had_ws {
-                    return Err(self.syntax());
-                }
-            }
-        }
-
-        self.write_len(out, 4, count as u64, spec)?;
-        out.extend_from_slice(&body);
-        Ok(())
+        self.container(out, 4, "]", |parser, body| parser.item(body, depth))
     }
 
     fn map(&mut self, out: &mut Vec<u8>, depth: usize) -> Result<(), Error> {
         self.expect("{")?;
+        self.container(out, 5, "}", |parser, body| {
+            parser.item(body, depth)?;
+            parser.skip_ws()?;
+            parser.expect(":")?;
+            parser.item(body, depth)
+        })
+    }
+
+    // Parses the entries of an array or map after its opening bracket. An
+    // indefinite container streams into `out`; a definite one buffers its
+    // entries until their count, and so the header, is known.
+    fn container(
+        &mut self,
+        out: &mut Vec<u8>,
+        major: u8,
+        close: &str,
+        mut entry: impl FnMut(&mut Self, &mut Vec<u8>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let spec = self.parse_spec();
         let spaced = self.consume_ws()?;
         if spec != Indicator::None && !spaced && !matches!(self.peek(), Some(']' | '}')) {
@@ -405,65 +346,30 @@ impl<'a> Parser<'a> {
         }
 
         let indefinite = spec == Indicator::Indefinite;
-        if indefinite {
-            out.push(0xbf);
-            if self.eat("}") {
-                out.push(0xff);
-                return Ok(());
-            }
-
-            loop {
-                self.item(out, depth)?;
-                self.skip_ws()?;
-                self.expect(":")?;
-                self.item(out, depth)?;
-                let had_ws = self.consume_ws()?;
-                if self.eat(",") {
-                    self.skip_ws()?;
-                    if self.eat("}") {
-                        out.push(0xff);
-                        return Ok(());
-                    }
-                    continue;
-                }
-                if self.eat("}") {
-                    out.push(0xff);
-                    return Ok(());
-                }
-                if !had_ws {
-                    return Err(self.syntax());
-                }
-            }
-        }
-
         let mut body = Vec::new();
+        let target = if indefinite {
+            out.push((major << 5) | 31);
+            &mut *out
+        } else {
+            &mut body
+        };
         let mut count = 0usize;
-        if !self.eat("}") {
+        if !self.eat(close) {
             loop {
-                self.item(&mut body, depth)?;
-                self.skip_ws()?;
-                self.expect(":")?;
-                self.item(&mut body, depth)?;
+                entry(self, target)?;
                 count += 1;
-                let had_ws = self.consume_ws()?;
-                if self.eat(",") {
-                    self.skip_ws()?;
-                    if self.eat("}") {
-                        break;
-                    }
-                    continue;
-                }
-                if self.eat("}") {
+                if self.list_end(Some(close))? {
                     break;
                 }
-                if !had_ws {
-                    return Err(self.syntax());
-                }
             }
         }
 
-        self.write_len(out, 5, count as u64, spec)?;
-        out.extend_from_slice(&body);
+        if indefinite {
+            out.push(0xff);
+        } else {
+            self.write_len(out, major, count as u64, spec)?;
+            out.extend_from_slice(&body);
+        }
         Ok(())
     }
 
@@ -501,19 +407,8 @@ impl<'a> Parser<'a> {
             }
             chunks.extend_from_slice(&chunk);
 
-            let had_ws = self.consume_ws()?;
-            if self.eat(",") {
-                self.skip_ws()?;
-                if self.eat(")") {
-                    break;
-                }
-                continue;
-            }
-            if self.eat(")") {
+            if self.list_end(Some(")"))? {
                 break;
-            }
-            if !had_ws {
-                return Err(self.syntax());
             }
         }
 
@@ -832,11 +727,9 @@ impl<'a> Parser<'a> {
                 self.escape(&mut out, quote)?;
                 continue;
             }
-            if ch == '\r' {
-                continue;
-            }
             // The `unescaped` grammar excludes the C0 controls other than
-            // LF (CR was dropped above) but allows DEL and the C1 range.
+            // LF (source CR is removed before parsing) but allows DEL and
+            // the C1 range.
             if ch != '\n' && (ch as u32) < 0x20 {
                 return Err(self.syntax());
             }
@@ -934,22 +827,21 @@ impl<'a> Parser<'a> {
         let mut content = &self.input[content_start..content_end];
         self.pos = content_end + width;
 
+        // Source CR is removed before parsing, so LF is the only newline.
         if content.is_empty()
             || content
                 .chars()
-                .any(|ch| ch.is_ascii_control() && !matches!(ch, '\n' | '\r'))
+                .any(|ch| ch.is_ascii_control() && ch != '\n')
         {
             return Err(self.syntax());
         }
-        if let Some(stripped) = content.strip_prefix("\r\n") {
-            content = stripped;
-        } else if let Some(stripped) = content.strip_prefix('\n') {
+        if let Some(stripped) = content.strip_prefix('\n') {
             content = stripped;
         } else if content.starts_with(' ') && content.ends_with(' ') && content.len() >= 2 {
             content = &content[1..content.len() - 1];
         }
 
-        Ok(content.chars().filter(|&ch| ch != '\r').collect())
+        Ok(content.to_string())
     }
 
     fn apply_app_string(&self, prefix: &str, content: String) -> Result<Atom, Error> {
@@ -1005,12 +897,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(super) fn emit_atom(
-        &self,
-        out: &mut Vec<u8>,
-        atom: Atom,
-        spec: Indicator<'a>,
-    ) -> Result<(), Error> {
+    fn emit_atom(&self, out: &mut Vec<u8>, atom: Atom, spec: Indicator<'a>) -> Result<(), Error> {
         match atom {
             Atom::Integer(x) => self.write_integer(out, &x, spec),
             Atom::Float(x) => self.write_float(out, x, spec),
@@ -1054,7 +941,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(super) fn write_integer(
+    fn write_integer(
         &self,
         out: &mut Vec<u8>,
         int: &BigInt,
@@ -1081,9 +968,8 @@ impl<'a> Parser<'a> {
 
     fn write_float(&self, out: &mut Vec<u8>, value: f64, spec: Indicator<'a>) -> Result<(), Error> {
         match spec {
-            Indicator::None | Indicator::Other(..) => {
-                let mut enc = Encoder::from(out);
-                enc.push(Header::Float(value))?;
+            Indicator::None | Indicator::Other(..) | Indicator::Indefinite => {
+                Encoder::from(out).push(Header::Float(value))?;
                 Ok(())
             }
             Indicator::Immediate => Err(self.semantic("float cannot use `_i` encoding indicator")),
@@ -1109,29 +995,17 @@ impl<'a> Parser<'a> {
             }
             Indicator::Ai(0) => Err(self.semantic("float cannot use `_0` encoding indicator")),
             Indicator::Ai(_) => Err(self.semantic("unsupported float encoding indicator")),
-            Indicator::Indefinite => {
-                let mut enc = Encoder::from(out);
-                enc.push(Header::Float(value))?;
-                Ok(())
-            }
         }
     }
 
-    pub(super) fn write_simple(
-        &self,
-        out: &mut Vec<u8>,
-        value: u8,
-        spec: Indicator<'a>,
-    ) -> Result<(), Error> {
+    fn write_simple(&self, out: &mut Vec<u8>, value: u8, spec: Indicator<'a>) -> Result<(), Error> {
         match spec {
-            Indicator::None | Indicator::Other(..) => {
-                let mut enc = Encoder::from(out);
-                enc.push(Header::Simple(value))?;
+            Indicator::None | Indicator::Other(..) | Indicator::Indefinite => {
+                Encoder::from(out).push(Header::Simple(value))?;
                 Ok(())
             }
             Indicator::Immediate if value <= 23 => {
-                let mut enc = Encoder::from(out);
-                enc.push(Header::Simple(value))?;
+                Encoder::from(out).push(Header::Simple(value))?;
                 Ok(())
             }
             Indicator::Immediate => Err(self.semantic("simple value does not fit `_i`")),
@@ -1144,11 +1018,6 @@ impl<'a> Parser<'a> {
                     .semantic("two-byte encodings of simple values below 32 are not well-formed"))
             }
             Indicator::Ai(..) => Err(self.semantic("simple values only support `_i` or `_0`")),
-            Indicator::Indefinite => {
-                let mut enc = Encoder::from(out);
-                enc.push(Header::Simple(value))?;
-                Ok(())
-            }
         }
     }
 

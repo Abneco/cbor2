@@ -606,6 +606,34 @@ impl<'de> Deserializer<SliceSource<'de>> {
             preserve_simple: false,
         }
     }
+
+    /// Turns this deserializer into an iterator over consecutive top-level
+    /// items of a CBOR sequence (RFC 8742) held in memory.
+    ///
+    /// Unlike the reader form, items may borrow from the slice. The iterator
+    /// ends when the input is exhausted and stops after the first error,
+    /// since the position inside a failed item is unspecified.
+    ///
+    /// ```rust
+    /// let mut stream = Vec::new();
+    /// cbor2::to_writer(&"one", &mut stream).unwrap();
+    /// cbor2::to_writer(&"two", &mut stream).unwrap();
+    ///
+    /// let words: Vec<&str> = cbor2::de::Deserializer::from_slice(&stream)
+    ///     .into_iter()
+    ///     .collect::<Result<_, _>>()
+    ///     .unwrap();
+    ///
+    /// assert_eq!(words, ["one", "two"]);
+    /// ```
+    // Named for symmetry with `serde_json::Deserializer::into_iter`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn into_iter<T: de::Deserialize<'de>>(self) -> SliceIter<'de, T> {
+        SliceIter {
+            de: Some(self),
+            _marker: core::marker::PhantomData,
+        }
+    }
 }
 
 #[cfg(feature = "alloc")]
@@ -632,9 +660,9 @@ impl<S: Source> Deserializer<S> {
     }
 
     // `#[cbor(tag = ...)]` emits a tag on encode, but tags are transparent on
-    // decode. Strip any leading tag layers for marked newtype/unit/tuple
-    // structs before delegating to serde's generated visitor; map/array
-    // structs also skip tags in their own dispatch loop below.
+    // decode. Strip any leading tag layers for a marked newtype struct before
+    // delegating to serde's generated visitor, whose inner type may not skip
+    // tags itself; every other struct form skips them in its dispatch loop.
     fn skip_struct_tags(&mut self, name: &'static str) -> Result<(), Error> {
         let Some(crate::ser::StructMarker { tag: Some(..), .. }) =
             crate::ser::parse_struct_marker(name)
@@ -845,78 +873,60 @@ fn single_char(s: &str) -> Option<char> {
 impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
     type Error = Error;
 
+    // Dispatches on the pulled header directly: pushing it back for a typed
+    // entry point would bypass the slice fast paths and pull it twice.
     #[inline]
     fn deserialize_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let header = self.source.pull()?;
-
-        // Tags are handled here directly; everything else is pushed back
-        // and re-dispatched to the matching typed entry point.
-        if let Header::Tag(tag) = header {
-            return match tag {
-                // Bignums lossy-coerce into plain integers whenever they
-                // fit; otherwise they survive as a tagged byte string.
-                tag::BIGPOS | tag::BIGNEG => {
-                    let b = self.bignum()?;
-
-                    let int = match big_to_u128(&b) {
-                        Some(x) if tag == tag::BIGPOS => return visitor.visit_u128(x),
-                        Some(x) => i128::try_from(x).ok().map(|x| x ^ !0),
-                        None => None,
-                    };
-
-                    match int {
-                        Some(x) => visitor.visit_i128(x),
-                        None => {
-                            let access = TagAccess::new(BytesDeserializer::new(&b), Some(tag));
-                            visitor.visit_enum(access)
-                        }
-                    }
-                }
-
-                _ => self.recurse(|me| {
-                    let access = TagAccess::new(me, Some(tag));
-                    visitor.visit_enum(access)
-                }),
-            };
-        }
-
-        if let Header::Simple(x) = header {
-            if (self.preserve_simple && x == simple::UNDEFINED)
-                || !matches!(
-                    x,
-                    simple::FALSE | simple::TRUE | simple::NULL | simple::UNDEFINED
-                )
-            {
-                let simple = crate::Simple::new(x).expect("decoder returns valid simple values");
-                return visitor.visit_enum(SimpleAccess::new(simple));
-            }
-        }
-
-        self.source.push(header);
-
-        match header {
-            Header::Positive(..) => self.deserialize_u64(visitor),
+        match self.source.pull()? {
+            Header::Positive(x) => visitor.visit_u64(x),
             Header::Negative(x) => match i64::try_from(x) {
-                Ok(..) => self.deserialize_i64(visitor),
-                Err(..) => self.deserialize_i128(visitor),
+                Ok(x) => visitor.visit_i64(-1 - x),
+                Err(..) => visitor.visit_i128(x as i128 ^ !0),
             },
 
-            Header::Bytes(..) => self.deserialize_byte_buf(visitor),
-            Header::Text(..) => self.deserialize_string(visitor),
+            Header::Bytes(len) => self.visit_byte_buf(len, visitor),
+            Header::Text(len) => self.visit_string(len, visitor),
 
-            Header::Array(..) => self.deserialize_seq(visitor),
-            Header::Map(..) => self.deserialize_map(visitor),
+            Header::Array(len) => self.visit_array(len, visitor),
+            Header::Map(len) => self.visit_object(len, "", visitor),
 
-            Header::Float(..) => self.deserialize_f64(visitor),
+            Header::Float(x) => visitor.visit_f64(x),
 
-            Header::Simple(simple::FALSE) => self.deserialize_bool(visitor),
-            Header::Simple(simple::TRUE) => self.deserialize_bool(visitor),
-            Header::Simple(simple::NULL) => self.deserialize_option(visitor),
-            Header::Simple(simple::UNDEFINED) => self.deserialize_option(visitor),
-            h @ Header::Simple(..) => Err(h.expected("known simple value")),
+            Header::Simple(simple::FALSE) => visitor.visit_bool(false),
+            Header::Simple(simple::TRUE) => visitor.visit_bool(true),
+            Header::Simple(simple::NULL) => visitor.visit_none(),
+            Header::Simple(simple::UNDEFINED) if !self.preserve_simple => visitor.visit_none(),
+            Header::Simple(x) => {
+                let simple = crate::Simple::new(x).expect("decoder returns valid simple values");
+                visitor.visit_enum(SimpleAccess::new(simple))
+            }
 
-            // Only `Break` is left: the tag case was handled above.
-            h => Err(h.expected("non-break")),
+            // Bignums lossy-coerce into plain integers whenever they fit;
+            // otherwise they survive as a tagged byte string.
+            Header::Tag(tag @ (tag::BIGPOS | tag::BIGNEG)) => {
+                let b = self.bignum()?;
+
+                let int = match big_to_u128(&b) {
+                    Some(x) if tag == tag::BIGPOS => return visitor.visit_u128(x),
+                    Some(x) => i128::try_from(x).ok().map(|x| x ^ !0),
+                    None => None,
+                };
+
+                match int {
+                    Some(x) => visitor.visit_i128(x),
+                    None => {
+                        let access = TagAccess::new(BytesDeserializer::new(&b), Some(tag));
+                        visitor.visit_enum(access)
+                    }
+                }
+            }
+
+            Header::Tag(tag) => self.recurse(|me| {
+                let access = TagAccess::new(me, Some(tag));
+                visitor.visit_enum(access)
+            }),
+
+            header @ Header::Break => Err(header.expected("non-break")),
         }
     }
 
@@ -1000,26 +1010,23 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
             return match header {
                 Header::Tag(..) => continue,
 
-                Header::Text(Some(len)) if len <= 4 => match self.source.borrow_body(len) {
-                    Some(res) => {
-                        let s = core::str::from_utf8(res?).map_err(|_| Error::Syntax(offset))?;
-                        match single_char(s) {
-                            Some(c) => visitor.visit_char(c),
-                            None => Err(header.expected("char")),
+                // A char is at most four UTF-8 bytes; a reader fills a stack
+                // buffer so both sources report errors the same way.
+                Header::Text(Some(len)) if len <= 4 => {
+                    let mut buffer = [0u8; 4];
+                    let bytes = match self.source.borrow_body(len) {
+                        Some(res) => res?,
+                        None => {
+                            self.source.read_exact(&mut buffer[..len])?;
+                            &buffer[..len]
                         }
+                    };
+                    let s = core::str::from_utf8(bytes).map_err(|_| Error::Syntax(offset))?;
+                    match single_char(s) {
+                        Some(c) => visitor.visit_char(c),
+                        None => Err(header.expected("char")),
                     }
-                    None => {
-                        self.scratch.clear();
-                        self.source.bytes_body(Some(len), &mut self.scratch)?;
-                        match core::str::from_utf8(&self.scratch)
-                            .ok()
-                            .and_then(single_char)
-                        {
-                            Some(c) => visitor.visit_char(c),
-                            None => Err(Error::Syntax(offset)),
-                        }
-                    }
-                },
+                }
 
                 Header::Text(None) => {
                     let mut buffer = String::new();
@@ -1039,29 +1046,10 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
         loop {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
-
-                Header::Text(Some(len)) => {
+                Header::Text(len) => {
                     let offset = self.source.offset();
-                    match self.source.borrow_body(len) {
-                        Some(res) => {
-                            let s =
-                                core::str::from_utf8(res?).map_err(|_| Error::Syntax(offset))?;
-                            visitor.visit_borrowed_str(s)
-                        }
-                        None => {
-                            let mut buffer = String::new();
-                            self.source.text_body(Some(len), &mut buffer)?;
-                            visitor.visit_str(&buffer)
-                        }
-                    }
+                    self.visit_str(len, offset, visitor)
                 }
-
-                Header::Text(None) => {
-                    let mut buffer = String::new();
-                    self.source.text_body(None, &mut buffer)?;
-                    visitor.visit_str(&buffer)
-                }
-
                 header => Err(header.expected("string")),
             };
         }
@@ -1071,29 +1059,7 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
         loop {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
-
-                Header::Text(Some(len)) => {
-                    let offset = self.source.offset();
-                    match self.source.borrow_body(len) {
-                        Some(res) => {
-                            let s =
-                                core::str::from_utf8(res?).map_err(|_| Error::Syntax(offset))?;
-                            visitor.visit_borrowed_str(s)
-                        }
-                        None => {
-                            let mut buffer = String::new();
-                            self.source.text_body(Some(len), &mut buffer)?;
-                            visitor.visit_string(buffer)
-                        }
-                    }
-                }
-
-                Header::Text(None) => {
-                    let mut buffer = String::new();
-                    self.source.text_body(None, &mut buffer)?;
-                    visitor.visit_string(buffer)
-                }
-
+                Header::Text(len) => self.visit_string(len, visitor),
                 header => Err(header.expected("string")),
             };
         }
@@ -1103,25 +1069,9 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
         loop {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
-
-                Header::Bytes(Some(len)) => match self.source.borrow_body(len) {
-                    Some(res) => visitor.visit_borrowed_bytes(res?),
-                    None => {
-                        self.scratch.clear();
-                        self.source.bytes_body(Some(len), &mut self.scratch)?;
-                        visitor.visit_bytes(&self.scratch)
-                    }
-                },
-
-                Header::Bytes(None) => {
-                    self.scratch.clear();
-                    self.source.bytes_body(None, &mut self.scratch)?;
-                    visitor.visit_bytes(&self.scratch)
-                }
-
+                Header::Bytes(len) => self.visit_bytes(len, visitor),
                 // Be liberal: accept an array of integers as bytes.
                 Header::Array(len) => self.visit_array(len, visitor),
-
                 header => Err(header.expected("bytes")),
             };
         }
@@ -1134,16 +1084,9 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
         loop {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
-
-                Header::Bytes(len) => {
-                    let mut buffer = Vec::new();
-                    self.source.bytes_body(len, &mut buffer)?;
-                    visitor.visit_byte_buf(buffer)
-                }
-
+                Header::Bytes(len) => self.visit_byte_buf(len, visitor),
                 // Be liberal: accept an array of integers as bytes.
                 Header::Array(len) => self.visit_array(len, visitor),
-
                 header => Err(header.expected("bytes")),
             };
         }
@@ -1157,19 +1100,13 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
                 Header::Array(len) => self.visit_array(len, visitor),
 
                 // Be liberal: accept a byte string as a sequence of integers.
-                Header::Bytes(Some(len)) => match self.source.borrow_body(len) {
-                    Some(res) => visit_byte_seq(res?, visitor),
-                    None => {
-                        let mut buffer = Vec::new();
-                        self.source.bytes_body(Some(len), &mut buffer)?;
-                        visit_byte_seq(&buffer, visitor)
+                Header::Bytes(len) => {
+                    if let Some(res) = len.and_then(|len| self.source.borrow_body(len)) {
+                        return visit_byte_seq(res?, visitor);
                     }
-                },
-
-                Header::Bytes(None) => {
-                    let mut buffer = Vec::new();
-                    self.source.bytes_body(None, &mut buffer)?;
-                    visit_byte_seq(&buffer, visitor)
+                    self.scratch.clear();
+                    self.source.bytes_body(len, &mut self.scratch)?;
+                    visit_byte_seq(&self.scratch, visitor)
                 }
 
                 header => Err(header.expected("array")),
@@ -1197,7 +1134,6 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
             return self.deserialize_map(visitor);
         };
 
-        self.skip_struct_tags(name)?;
         loop {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
@@ -1225,11 +1161,10 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
 
     fn deserialize_tuple_struct<V: de::Visitor<'de>>(
         self,
-        name: &'static str,
+        _name: &'static str,
         _len: usize,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        self.skip_struct_tags(name)?;
         self.deserialize_seq(visitor)
     }
 
@@ -1243,41 +1178,8 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
             return match self.source.pull()? {
                 Header::Tag(..) => continue,
 
-                Header::Text(Some(len)) => match self.source.borrow_body(len) {
-                    Some(res) => {
-                        let s = core::str::from_utf8(res?).map_err(|_| Error::Syntax(offset))?;
-                        visitor.visit_borrowed_str(s)
-                    }
-                    None => {
-                        self.scratch.clear();
-                        self.source.bytes_body(Some(len), &mut self.scratch)?;
-                        match core::str::from_utf8(&self.scratch) {
-                            Ok(s) => visitor.visit_str(s),
-                            Err(..) => Err(Error::Syntax(offset)),
-                        }
-                    }
-                },
-
-                Header::Text(None) => {
-                    let mut buffer = String::new();
-                    self.source.text_body(None, &mut buffer)?;
-                    visitor.visit_str(&buffer)
-                }
-
-                Header::Bytes(Some(len)) => match self.source.borrow_body(len) {
-                    Some(res) => visitor.visit_borrowed_bytes(res?),
-                    None => {
-                        self.scratch.clear();
-                        self.source.bytes_body(Some(len), &mut self.scratch)?;
-                        visitor.visit_bytes(&self.scratch)
-                    }
-                },
-
-                Header::Bytes(None) => {
-                    self.scratch.clear();
-                    self.source.bytes_body(None, &mut self.scratch)?;
-                    visitor.visit_bytes(&self.scratch)
-                }
+                Header::Text(len) => self.visit_str(len, offset, visitor),
+                Header::Bytes(len) => self.visit_bytes(len, visitor),
 
                 // Integer keys match struct fields through the key table
                 // of a marked struct (handled in `StructAccess`); in any
@@ -1343,10 +1245,9 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
     #[inline]
     fn deserialize_unit_struct<V: de::Visitor<'de>>(
         self,
-        name: &'static str,
+        _name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        self.skip_struct_tags(name)?;
         self.deserialize_unit(visitor)
     }
 
@@ -1476,6 +1377,80 @@ impl<S: Source> Access<'_, S> {
 
 #[cfg(feature = "alloc")]
 impl<'de, S: BorrowSource<'de>> Deserializer<S> {
+    // Visits a text body as `&str`: borrowed from a slice source, otherwise
+    // staged in the scratch buffer. `offset` locates UTF-8 errors.
+    #[inline]
+    fn visit_str<V: de::Visitor<'de>>(
+        &mut self,
+        len: Option<usize>,
+        offset: usize,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        let Some(len) = len else {
+            // Segments are validated one by one, so they need a String.
+            let mut buffer = String::new();
+            self.source.text_body(None, &mut buffer)?;
+            return visitor.visit_str(&buffer);
+        };
+        if let Some(res) = self.source.borrow_body(len) {
+            let s = core::str::from_utf8(res?).map_err(|_| Error::Syntax(offset))?;
+            return visitor.visit_borrowed_str(s);
+        }
+        self.scratch.clear();
+        self.source.bytes_body(Some(len), &mut self.scratch)?;
+        match core::str::from_utf8(&self.scratch) {
+            Ok(s) => visitor.visit_str(s),
+            Err(..) => Err(Error::Syntax(offset)),
+        }
+    }
+
+    // Visits a text body as an owned `String`, unless it can be borrowed.
+    #[inline]
+    fn visit_string<V: de::Visitor<'de>>(
+        &mut self,
+        len: Option<usize>,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        if let Some(len) = len {
+            let offset = self.source.offset();
+            if let Some(res) = self.source.borrow_body(len) {
+                let s = core::str::from_utf8(res?).map_err(|_| Error::Syntax(offset))?;
+                return visitor.visit_borrowed_str(s);
+            }
+        }
+        let mut buffer = String::new();
+        self.source.text_body(len, &mut buffer)?;
+        visitor.visit_string(buffer)
+    }
+
+    // Visits a byte string body as `&[u8]`: borrowed from a slice source,
+    // otherwise staged in the scratch buffer.
+    #[inline]
+    fn visit_bytes<V: de::Visitor<'de>>(
+        &mut self,
+        len: Option<usize>,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        if let Some(res) = len.and_then(|len| self.source.borrow_body(len)) {
+            return visitor.visit_borrowed_bytes(res?);
+        }
+        self.scratch.clear();
+        self.source.bytes_body(len, &mut self.scratch)?;
+        visitor.visit_bytes(&self.scratch)
+    }
+
+    // Visits a byte string body as an owned buffer.
+    #[inline]
+    fn visit_byte_buf<V: de::Visitor<'de>>(
+        &mut self,
+        len: Option<usize>,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        let mut buffer = Vec::new();
+        self.source.bytes_body(len, &mut buffer)?;
+        visitor.visit_byte_buf(buffer)
+    }
+
     #[inline]
     fn visit_array<V: de::Visitor<'de>>(
         &mut self,
@@ -1817,6 +1792,35 @@ impl<T: de::DeserializeOwned, R: Read> Iterator for Iter<T, R> {
         }
 
         Some(T::deserialize(&mut self.de))
+    }
+}
+
+/// An iterator decoding consecutive top-level items from a byte slice.
+///
+/// Created by [`Deserializer::into_iter`] on a slice deserializer.
+#[cfg(feature = "alloc")]
+pub struct SliceIter<'de, T> {
+    // `None` once the input is exhausted or an item failed.
+    de: Option<Deserializer<SliceSource<'de>>>,
+    _marker: core::marker::PhantomData<T>,
+}
+
+#[cfg(feature = "alloc")]
+impl<'de, T: de::Deserialize<'de>> Iterator for SliceIter<'de, T> {
+    type Item = Result<T, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let de = self.de.as_mut()?;
+        if de.source.0.is_exhausted() {
+            self.de = None;
+            return None;
+        }
+
+        let item = T::deserialize(de);
+        if item.is_err() {
+            self.de = None;
+        }
+        Some(item)
     }
 }
 
@@ -2180,8 +2184,8 @@ pub(crate) fn value_from_slice(slice: &[u8]) -> Result<crate::Value, Error> {
 /// Deserializes a value from a byte slice of CBOR.
 ///
 /// This decodes the first complete CBOR item in `slice`. It does not report
-/// trailing data; call [`validate`] first if trailing bytes should be an
-/// error. Definite-length text and byte strings can be borrowed from the
+/// trailing data; call [`validate_slice`] first if trailing bytes should be
+/// an error. Definite-length text and byte strings can be borrowed from the
 /// input slice, so targets such as `&str` and `serde_bytes::Bytes` do not
 /// require intermediate allocation. Indefinite-length segmented strings
 /// cannot be borrowed because their logical body is not contiguous.
@@ -2191,7 +2195,7 @@ pub(crate) fn value_from_slice(slice: &[u8]) -> Result<crate::Value, Error> {
 /// bytes.extend(cbor2::to_vec(&2u8).unwrap());
 ///
 /// assert_eq!(cbor2::from_slice::<u8>(&bytes).unwrap(), 1);
-/// assert!(cbor2::validate(&bytes[..]).is_err());
+/// assert!(cbor2::validate_slice(&bytes).is_err());
 /// ```
 #[cfg(feature = "alloc")]
 #[inline]

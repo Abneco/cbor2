@@ -109,7 +109,16 @@ impl RawValue {
     }
 
     /// Decodes the raw item into any deserializable type.
-    pub fn deserialized<T: de::DeserializeOwned>(&self) -> Result<T, crate::de::Error> {
+    ///
+    /// Like [`from_slice`](crate::from_slice), definite-length text and byte
+    /// strings can be borrowed from the raw bytes.
+    ///
+    /// ```rust
+    /// let raw = cbor2::RawValue::serialized(&("kid", 7u8)).unwrap();
+    /// let (kid, n): (&str, u8) = raw.deserialized().unwrap();
+    /// assert_eq!((kid, n), ("kid", 7));
+    /// ```
+    pub fn deserialized<'de, T: de::Deserialize<'de>>(&'de self) -> Result<T, crate::de::Error> {
         crate::from_slice(&self.0)
     }
 
@@ -299,14 +308,6 @@ fn bytes_serializer() -> RawBytesSerializer<impl FnOnce(&[u8]) -> Result<Vec<u8>
     }
 }
 
-macro_rules! not_raw_bytes {
-    ($($f:ident($($t:ty),*);)+) => {$(
-        fn $f(self, $(_: $t),*) -> Result<T, E> {
-            Err(E::custom(NotRawBytes))
-        }
-    )+};
-}
-
 impl<F, T, E: ser::Error> ser::Serializer for RawBytesSerializer<F>
 where
     F: FnOnce(&[u8]) -> Result<T, E>,
@@ -314,112 +315,28 @@ where
     type Ok = T;
     type Error = E;
 
-    type SerializeSeq = ser::Impossible<T, E>;
-    type SerializeTuple = ser::Impossible<T, E>;
-    type SerializeTupleStruct = ser::Impossible<T, E>;
-    type SerializeTupleVariant = ser::Impossible<T, E>;
-    type SerializeMap = ser::Impossible<T, E>;
-    type SerializeStruct = ser::Impossible<T, E>;
-    type SerializeStructVariant = ser::Impossible<T, E>;
-
     #[inline]
     fn serialize_bytes(self, v: &[u8]) -> Result<T, E> {
         (self.write)(v)
     }
 
-    not_raw_bytes! {
-        serialize_bool(bool);
-        serialize_i8(i8);
-        serialize_i16(i16);
-        serialize_i32(i32);
-        serialize_i64(i64);
-        serialize_i128(i128);
-        serialize_u8(u8);
-        serialize_u16(u16);
-        serialize_u32(u32);
-        serialize_u64(u64);
-        serialize_u128(u128);
-        serialize_f32(f32);
-        serialize_f64(f64);
-        serialize_char(char);
-        serialize_str(&str);
-        serialize_none();
-        serialize_unit();
-        serialize_unit_struct(&'static str);
-    }
-
-    fn serialize_unit_variant(self, _: &'static str, _: u32, _: &'static str) -> Result<T, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_some<U: ?Sized + ser::Serialize>(self, _: &U) -> Result<T, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_newtype_struct<U: ?Sized + ser::Serialize>(
-        self,
-        _: &'static str,
-        _: &U,
-    ) -> Result<T, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_newtype_variant<U: ?Sized + ser::Serialize>(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: &U,
-    ) -> Result<T, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeTupleStruct, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeTupleVariant, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self::SerializeStruct, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn serialize_struct_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeStructVariant, E> {
-        Err(E::custom(NotRawBytes))
-    }
-
-    fn is_human_readable(&self) -> bool {
-        false
+    crate::ser::reject_serializer! {
+        E::custom(NotRawBytes);
+        serialize_bool(bool),
+        serialize_i8(i8),
+        serialize_i16(i16),
+        serialize_i32(i32),
+        serialize_i64(i64),
+        serialize_i128(i128),
+        serialize_u8(u8),
+        serialize_u16(u16),
+        serialize_u32(u32),
+        serialize_u64(u64),
+        serialize_u128(u128),
+        serialize_f32(f32),
+        serialize_f64(f64),
+        serialize_char(char),
+        serialize_str(&str),
     }
 }
 

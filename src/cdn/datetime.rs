@@ -2,26 +2,32 @@ use alloc::{format, string::String, vec::Vec};
 
 use crate::de::Error;
 
-use super::encode::write_uint;
-use super::parser::Parser;
-use super::types::{Atom, BigInt, Indicator};
+use super::encode::{write_int, write_tag};
+use super::types::{Atom, BigInt};
 
 pub(super) fn datetime_atom(content: &str, tagged: bool, offset: usize) -> Result<Atom, Error> {
     let (seconds, fractional) = parse_datetime(content, offset)?;
-    let atom = if let Some(frac) = fractional {
-        Atom::Float(epoch_float(seconds, frac, offset)?)
-    } else {
-        Atom::Integer(BigInt::from_i128(seconds))
+    let float = match fractional {
+        Some(frac) => Some(epoch_float(seconds, frac, offset)?),
+        None => None,
     };
     if !tagged {
-        return Ok(atom);
+        return Ok(match float {
+            Some(value) => Atom::Float(value),
+            None => Atom::Integer(BigInt::from_i128(seconds)),
+        });
     }
 
-    let mut inner = Vec::new();
-    Parser::new("").emit_atom(&mut inner, atom, Indicator::None)?;
+    // Tag 1 around the epoch in preferred encoding; four-digit years keep
+    // the seconds far inside the CBOR integer range.
     let mut out = Vec::new();
-    write_uint(&mut out, 6, 1, Indicator::None).map_err(|msg| Error::semantic(offset, msg))?;
-    out.extend_from_slice(&inner);
+    write_tag(&mut out, 1)?;
+    match float {
+        Some(value) => crate::core::Encoder::from(&mut out)
+            .push(crate::core::Header::Float(value))
+            .expect("Vec writes are infallible"),
+        None => write_int(&mut out, seconds),
+    }
     Ok(Atom::Raw(out))
 }
 

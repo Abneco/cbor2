@@ -110,6 +110,17 @@ fn chars() {
     assert!(matches!(de::<char>("62fffe"), Err(Error::Syntax(0))));
     // A text item longer than four bytes cannot be a char.
     assert!(de::<char>("6568656c6c6f").is_err());
+
+    // Readers report the same error kinds as slices.
+    let reader = |hex: &str| cbor2::from_reader::<char, _>(&hex::decode(hex).unwrap()[..]);
+    assert_eq!(reader("63e6b0b4").unwrap(), '水');
+    for hex in ["626162", "60"] {
+        let (slice, reader) = (de::<char>(hex).unwrap_err(), reader(hex).unwrap_err());
+        assert!(matches!(slice, Error::Semantic(..)), "{hex}: {slice:?}");
+        assert!(matches!(reader, Error::Semantic(..)), "{hex}: {reader:?}");
+        assert_eq!(slice.to_string(), reader.to_string(), "{hex}");
+    }
+    assert!(matches!(reader("62fffe"), Err(Error::Syntax(0))));
 }
 
 #[test]
@@ -351,6 +362,37 @@ fn stream_iterator_errors() {
     let mut iter = cbor2::de::Deserializer::from_reader(&[0x01, 0x1c][..]).into_iter::<u32>();
     assert_eq!(iter.next().unwrap().unwrap(), 1);
     assert!(matches!(iter.next().unwrap(), Err(Error::Syntax(1))));
+}
+
+#[test]
+fn slice_stream_iterator() {
+    let mut stream = Vec::new();
+    cbor2::to_writer(&"one", &mut stream).unwrap();
+    cbor2::to_writer(&"two", &mut stream).unwrap();
+
+    // Items borrow from the input.
+    let words: Vec<&str> = cbor2::de::Deserializer::from_slice(&stream)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(words, ["one", "two"]);
+
+    // Empty input is an empty sequence.
+    let mut iter = cbor2::de::Deserializer::from_slice(&[]).into_iter::<u32>();
+    assert!(iter.next().is_none());
+
+    // The iterator stops after the first error, even when the failed item
+    // consumed nothing (a reserved additional-information value).
+    let mut iter = cbor2::de::Deserializer::from_slice(&[0x01, 0x1c, 0x02]).into_iter::<u32>();
+    assert_eq!(iter.next().unwrap().unwrap(), 1);
+    assert!(matches!(iter.next().unwrap(), Err(Error::Syntax(1))));
+    assert!(iter.next().is_none());
+
+    // A truncated trailing item is an error, not a silent end.
+    let mut iter = cbor2::de::Deserializer::from_slice(&[0x01, 0x19, 0x01]).into_iter::<u32>();
+    assert_eq!(iter.next().unwrap().unwrap(), 1);
+    assert!(iter.next().unwrap().is_err());
+    assert!(iter.next().is_none());
 }
 
 #[test]

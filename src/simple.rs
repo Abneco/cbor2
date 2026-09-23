@@ -329,177 +329,27 @@ impl ser::Serializer for SimpleValueSerializer {
     type Ok = Simple;
     type Error = NotASimple;
 
-    type SerializeSeq = ser::Impossible<Simple, NotASimple>;
-    type SerializeTuple = ser::Impossible<Simple, NotASimple>;
-    type SerializeTupleStruct = ser::Impossible<Simple, NotASimple>;
-    type SerializeTupleVariant = ser::Impossible<Simple, NotASimple>;
-    type SerializeMap = ser::Impossible<Simple, NotASimple>;
-    type SerializeStruct = ser::Impossible<Simple, NotASimple>;
-    type SerializeStructVariant = ser::Impossible<Simple, NotASimple>;
-
     #[inline]
     fn serialize_u8(self, value: u8) -> Result<Simple, NotASimple> {
         Simple::new(value).ok_or(NotASimple)
     }
 
-    // Without alloc, serde provides no default for `collect_str`; a formatted
-    // string is never a simple value either way.
-    fn collect_str<T: ?Sized + core::fmt::Display>(self, _: &T) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_bool(self, _: bool) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_i8(self, _: i8) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_i16(self, _: i16) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_i32(self, _: i32) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_i64(self, _: i64) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_i128(self, _: i128) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_u16(self, _: u16) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_u32(self, _: u32) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_u64(self, _: u64) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_u128(self, _: u128) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_f32(self, _: f32) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_f64(self, _: f64) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_char(self, _: char) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_str(self, _: &str) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_bytes(self, _: &[u8]) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_none(self) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_some<T: ?Sized + ser::Serialize>(self, _: &T) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_unit(self) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_unit_struct(self, _: &'static str) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_unit_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-    ) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_newtype_struct<T: ?Sized + ser::Serialize>(
-        self,
-        _: &'static str,
-        _: &T,
-    ) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_newtype_variant<T: ?Sized + ser::Serialize>(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: &T,
-    ) -> Result<Simple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeTupleStruct, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeTupleVariant, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_struct(
-        self,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeStruct, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn serialize_struct_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> Result<Self::SerializeStructVariant, NotASimple> {
-        Err(NotASimple)
-    }
-
-    fn is_human_readable(&self) -> bool {
-        false
+    crate::ser::reject_serializer! {
+        NotASimple;
+        serialize_bool(bool),
+        serialize_i8(i8),
+        serialize_i16(i16),
+        serialize_i32(i32),
+        serialize_i64(i64),
+        serialize_i128(i128),
+        serialize_u16(u16),
+        serialize_u32(u32),
+        serialize_u64(u64),
+        serialize_u128(u128),
+        serialize_f32(f32),
+        serialize_f64(f64),
+        serialize_char(char),
+        serialize_str(&str),
+        serialize_bytes(&[u8]),
     }
 }

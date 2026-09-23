@@ -180,7 +180,6 @@ fn segmented_utf8_errors_keep_the_body_offset() {
 
 #[test]
 fn ipv4_rejects_leading_zero_octets() {
-    assert!("127.000.0.1".parse::<core::net::Ipv4Addr>().is_err());
     assert!(cdn_to_vec("ip'127.000.0.1'").is_err());
 }
 

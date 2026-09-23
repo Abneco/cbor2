@@ -195,6 +195,18 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
+Examples are executable documentation and CI runs all of them; after changing
+one, or the behavior it shows, run:
+
+```bash
+for example in examples/*.rs; do cargo run --quiet --all-features --example "$(basename "$example" .rs)" > /dev/null; done
+```
+
+Integration tests share their test doubles in `tests/it/util.rs`, and
+`tests/it/audit_crosscheck.rs` cross-checks the independent decoders,
+validators and encoders on generated items. Extend these instead of adding
+per-module copies or one-off comparisons.
+
 For CLI behavior changes, run `cargo test -p cbor2-cli`; use
 `cargo +1.89 test -p cbor2-cli --locked` when checking the declared MSRV.
 For benchmark or result-parser changes, run these separately from the
@@ -210,3 +222,12 @@ python3 -B -m unittest discover -s cbor2-bench -p 'test_*.py'
 Run release benchmarks for affected workloads when changing their measured
 paths. The separate stable-toolchain benchmark CI job only checks correctness,
 formatting and lint; it does not collect performance results.
+
+## Releases
+
+All three crates share `[workspace.package] version`. Bump it, move the
+`CHANGELOG.md` entries under the new version, and run
+`scripts/check-release-version.sh vX.Y.Z` before tagging; the release and
+crates.io workflows run the same check on the tag before building or
+publishing. Raise the `cbor2-derive` requirement in the root `Cargo.toml` when
+the derive starts calling newer runtime entry points.

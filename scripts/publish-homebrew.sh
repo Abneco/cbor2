@@ -58,8 +58,11 @@ fetch_checksum() {
         HASH=$(curl -fsSL "$CHECKSUM_URL" | awk '{print $1}' | tr -d '\r\n')
     fi
 
-    if [ -z "$HASH" ]; then
-        error "Could not read checksum for ${ASSET_NAME}"
+    case "$HASH" in
+        *[!0-9a-f]*) error "Invalid checksum for ${ASSET_NAME}: ${HASH}" ;;
+    esac
+    if [ "${#HASH}" -ne 64 ]; then
+        error "Could not read a SHA-256 checksum for ${ASSET_NAME}"
     fi
 
     printf '%s\n' "$HASH"
@@ -123,10 +126,10 @@ MACOS_X86_64_SHA=$(fetch_checksum "${BINARY_NAME}-macos-x86_64")
 LINUX_ARM64_SHA=$(fetch_checksum "${BINARY_NAME}-linux-arm64")
 LINUX_X86_64_SHA=$(fetch_checksum "${BINARY_NAME}-linux-x86_64")
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
 
-FORMULA_TMP="${TMPDIR}/${FORMULA_NAME}.rb"
+FORMULA_TMP="${WORK_DIR}/${FORMULA_NAME}.rb"
 write_formula > "$FORMULA_TMP"
 
 if [ "${DRY_RUN:-}" = "1" ]; then
@@ -141,8 +144,8 @@ elif [ -d "${LOCAL_TAP_DIR}/.git" ]; then
     TAP_DIR="$LOCAL_TAP_DIR"
 else
     [ -n "${HOMEBREW_TAP_TOKEN:-}" ] || error "Set HOMEBREW_TAP_TOKEN or HOMEBREW_TAP_DIR to publish the formula"
-    TAP_DIR="${TMPDIR}/tap"
-    TAP_ASKPASS="${TMPDIR}/git-askpass.sh"
+    TAP_DIR="${WORK_DIR}/tap"
+    TAP_ASKPASS="${WORK_DIR}/git-askpass.sh"
     cat > "$TAP_ASKPASS" <<'EOF'
 #!/bin/sh
 case "$1" in
@@ -159,16 +162,18 @@ fi
 mkdir -p "${TAP_DIR}/$(dirname "$FORMULA_PATH")"
 cp "$FORMULA_TMP" "${TAP_DIR}/${FORMULA_PATH}"
 
-git -C "$TAP_DIR" config user.name "${GIT_COMMITTER_NAME:-github-actions[bot]}"
-git -C "$TAP_DIR" config user.email "${GIT_COMMITTER_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
-
 if [ -z "$(git -C "$TAP_DIR" status --porcelain -- "$FORMULA_PATH")" ]; then
     info "Homebrew formula is already up to date."
     exit 0
 fi
 
-git -C "$TAP_DIR" add "$FORMULA_PATH"
-git -C "$TAP_DIR" commit -m "Update ${FORMULA_NAME} formula to ${TAG}"
+# Commit only the formula, with a one-off identity: an existing local tap
+# checkout keeps its own configuration and any other staged changes.
+git -C "$TAP_DIR" add -- "$FORMULA_PATH"
+git -C "$TAP_DIR" \
+    -c user.name="${GIT_COMMITTER_NAME:-github-actions[bot]}" \
+    -c user.email="${GIT_COMMITTER_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}" \
+    commit -m "Update ${FORMULA_NAME} formula to ${TAG}" -- "$FORMULA_PATH"
 
 if [ "${PUSH:-1}" = "1" ]; then
     if [ -n "${TAP_ASKPASS:-}" ]; then

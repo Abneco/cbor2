@@ -66,9 +66,17 @@ fn invalid_utf8_is_rejected() {
     ));
 
     // Each segment of an indefinite text item must be valid on its own:
-    // splitting a multi-byte character across segments is not well-formed.
-    let split = hex::decode("7f61e261829461acff").unwrap(); // "не" split mid-char... actually "∔" split
-    assert!(cbor2::from_slice::<String>(&split).is_err());
+    // splitting a multi-byte character across segments is not well-formed,
+    // even though the joined bytes "e2 82 ac" spell "€".
+    let split = hex::decode("7f62e28261acff").unwrap();
+    assert!(matches!(
+        cbor2::from_slice::<String>(&split),
+        Err(Error::Syntax(2))
+    ));
+    assert!(matches!(
+        cbor2::from_reader::<String, _>(&split[..]),
+        Err(Error::Syntax(2))
+    ));
 }
 
 #[test]

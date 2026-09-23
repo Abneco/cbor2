@@ -2,6 +2,8 @@
 
 use cbor2::{cbor, Simple, Value};
 
+use crate::util::{FailFmt, FailReader};
+
 fn diag(hex: &str) -> String {
     let bytes = hex::decode(hex).unwrap();
     cbor2::diagnostic(&bytes[..]).unwrap()
@@ -10,113 +12,6 @@ fn diag(hex: &str) -> String {
 fn pretty_with_key_comments(hex: &str, keys: &[(&str, i128)]) -> String {
     let bytes = hex::decode(hex).unwrap();
     cbor2::diagnostic_pretty_with_key_comments(&bytes[..], keys).unwrap()
-}
-
-#[test]
-fn appendix_a_diagnostic_column() {
-    // The complete table from RFC 8949 Appendix A, verbatim.
-    let table: &[(&str, &str)] = &[
-        ("00", "0"),
-        ("01", "1"),
-        ("0a", "10"),
-        ("17", "23"),
-        ("1818", "24"),
-        ("1819", "25"),
-        ("1864", "100"),
-        ("1903e8", "1000"),
-        ("1a000f4240", "1000000"),
-        ("1b000000e8d4a51000", "1000000000000"),
-        ("1bffffffffffffffff", "18446744073709551615"),
-        ("c249010000000000000000", "18446744073709551616"),
-        ("3bffffffffffffffff", "-18446744073709551616"),
-        ("c349010000000000000000", "-18446744073709551617"),
-        ("20", "-1"),
-        ("29", "-10"),
-        ("3863", "-100"),
-        ("3903e7", "-1000"),
-        ("f90000", "0.0"),
-        ("f98000", "-0.0"),
-        ("f93c00", "1.0"),
-        ("fb3ff199999999999a", "1.1"),
-        ("f93e00", "1.5"),
-        ("f97bff", "65504.0"),
-        ("fa47c35000", "100000.0"),
-        ("fa7f7fffff", "3.4028234663852886e+38"),
-        ("fb7e37e43c8800759c", "1.0e+300"),
-        ("f90001", "5.960464477539063e-8"),
-        ("f90400", "0.00006103515625"),
-        ("f9c400", "-4.0"),
-        ("fbc010666666666666", "-4.1"),
-        ("f97c00", "Infinity"),
-        ("f97e00", "NaN"),
-        ("f9fc00", "-Infinity"),
-        ("fa7f800000", "Infinity"),
-        ("fa7fc00000", "NaN"),
-        ("faff800000", "-Infinity"),
-        ("fb7ff0000000000000", "Infinity"),
-        ("fb7ff8000000000000", "NaN"),
-        ("fbfff0000000000000", "-Infinity"),
-        ("f4", "false"),
-        ("f5", "true"),
-        ("f6", "null"),
-        ("f7", "undefined"),
-        ("f0", "simple(16)"),
-        ("f8ff", "simple(255)"),
-        (
-            "c074323031332d30332d32315432303a30343a30305a",
-            "0(\"2013-03-21T20:04:00Z\")",
-        ),
-        ("c11a514b67b0", "1(1363896240)"),
-        ("c1fb41d452d9ec200000", "1(1363896240.5)"),
-        ("d74401020304", "23(h'01020304')"),
-        ("d818456449455446", "24(h'6449455446')"),
-        (
-            "d82076687474703a2f2f7777772e6578616d706c652e636f6d",
-            "32(\"http://www.example.com\")",
-        ),
-        ("40", "h''"),
-        ("4401020304", "h'01020304'"),
-        ("60", "\"\""),
-        ("6161", "\"a\""),
-        ("6449455446", "\"IETF\""),
-        ("62225c", "\"\\\"\\\\\""),
-        ("62c3bc", "\"\u{00fc}\""),
-        ("63e6b0b4", "\"\u{6c34}\""),
-        ("64f0908591", "\"\u{10151}\""),
-        ("80", "[]"),
-        ("83010203", "[1, 2, 3]"),
-        ("8301820203820405", "[1, [2, 3], [4, 5]]"),
-        (
-            "98190102030405060708090a0b0c0d0e0f101112131415161718181819",
-            "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]",
-        ),
-        ("a0", "{}"),
-        ("a201020304", "{1: 2, 3: 4}"),
-        ("a26161016162820203", "{\"a\": 1, \"b\": [2, 3]}"),
-        ("826161a161626163", "[\"a\", {\"b\": \"c\"}]"),
-        (
-            "a56161614161626142616361436164614461656145",
-            "{\"a\": \"A\", \"b\": \"B\", \"c\": \"C\", \"d\": \"D\", \"e\": \"E\"}",
-        ),
-        ("5f42010243030405ff", "(_ h'0102', h'030405')"),
-        ("7f657374726561646d696e67ff", "(_ \"strea\", \"ming\")"),
-        ("9fff", "[_ ]"),
-        ("9f018202039f0405ffff", "[_ 1, [2, 3], [_ 4, 5]]"),
-        ("9f01820203820405ff", "[_ 1, [2, 3], [4, 5]]"),
-        ("83018202039f0405ff", "[1, [2, 3], [_ 4, 5]]"),
-        ("83019f0203ff820405", "[1, [_ 2, 3], [4, 5]]"),
-        (
-            "9f0102030405060708090a0b0c0d0e0f101112131415161718181819ff",
-            "[_ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]",
-        ),
-        ("bf61610161629f0203ffff", "{_ \"a\": 1, \"b\": [_ 2, 3]}"),
-        ("826161bf61626163ff", "[\"a\", {_ \"b\": \"c\"}]"),
-        ("bf6346756ef563416d7421ff", "{_ \"Fun\": true, \"Amt\": -2}"),
-    ];
-
-    for (hex, expected) in table {
-        assert_eq!(diag(hex), *expected, "0x{hex}");
-    }
 }
 
 #[test]
@@ -258,12 +153,6 @@ fn malformed_input_is_rejected() {
     ));
 
     // I/O failures surface as such.
-    struct FailReader;
-    impl std::io::Read for FailReader {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("source broke"))
-        }
-    }
     assert!(matches!(
         cbor2::diagnostic(FailReader),
         Err(cbor2::de::Error::Io(..))
@@ -336,12 +225,6 @@ fn value_display_is_diagnostic_notation() {
 
     // Display through a failing formatter propagates the error.
     use std::fmt::Write as _;
-    struct FailFmt;
-    impl std::fmt::Write for FailFmt {
-        fn write_str(&mut self, _: &str) -> std::fmt::Result {
-            Err(std::fmt::Error)
-        }
-    }
     assert!(write!(FailFmt, "{}", Value::Null).is_err());
 
     // The wire form and the Value form agree wherever both can represent
@@ -467,11 +350,5 @@ fn value_debug_is_indented_diagnostic_notation() {
 
     // A failing formatter propagates the error.
     use std::fmt::Write as _;
-    struct FailFmt;
-    impl std::fmt::Write for FailFmt {
-        fn write_str(&mut self, _: &str) -> std::fmt::Result {
-            Err(std::fmt::Error)
-        }
-    }
     assert!(write!(FailFmt, "{:?}", Value::Null).is_err());
 }

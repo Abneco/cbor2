@@ -5,13 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use cbor2::{cbor, Value};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
-enum Enum {
-    Unit,
-    Newtype(u32),
-    Tuple(u32, u32),
-    Struct { x: u32 },
-}
+use crate::util::{Enum, FailWriter};
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 struct Plain {
@@ -777,17 +771,8 @@ fn unserializable_values_fail_inside_every_container() {
 
     // Value::Array and Value::Map serialized into a failing serializer:
     // the container headers themselves are rejected.
-    struct FW;
-    impl std::io::Write for FW {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("x"))
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    assert!(cbor2::to_writer(&Value::Array(vec![]), FW).is_err());
-    assert!(cbor2::to_writer(&Value::Map(vec![]), FW).is_err());
+    assert!(cbor2::to_writer(&Value::Array(vec![]), FailWriter).is_err());
+    assert!(cbor2::to_writer(&Value::Map(vec![]), FailWriter).is_err());
 
     // A failing key inside the *streaming* serializer's map path.
     assert!(cbor2::to_vec(&BoomKeyMap).is_err());

@@ -6,14 +6,26 @@ use std::fmt::Debug;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::util::{Enum, UnsizedSeq};
+
+// Every encoder and decoder path agrees: vector, sizing, fixed buffer,
+// slice, reader and the dynamic Value.
 fn roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T) {
     let bytes = cbor2::to_vec(&value).unwrap();
-    let back: T = cbor2::from_slice(&bytes).unwrap();
-    assert_eq!(value, back);
+    assert_eq!(cbor2::serialized_size(&value).unwrap(), bytes.len() as u64);
+    let mut buffer = vec![0; bytes.len()];
+    assert_eq!(cbor2::to_slice(&value, &mut buffer).unwrap(), &bytes[..]);
+    assert_eq!(cbor2::from_slice::<T>(&bytes).unwrap(), value);
+    assert_eq!(cbor2::from_reader::<T, _>(&bytes[..]).unwrap(), value);
+    let dynamic = cbor2::Value::serialized(&value).unwrap();
+    assert_eq!(cbor2::to_vec(&dynamic).unwrap(), bytes, "{value:?}");
+    assert_eq!(dynamic.deserialized::<T>().unwrap(), value);
 }
 
 fn assert_wire<T: Serialize>(value: T, hex: &str) {
-    assert_eq!(hex::encode(cbor2::to_vec(&value).unwrap()), hex);
+    let bytes = cbor2::to_vec(&value).unwrap();
+    assert_eq!(hex::encode(&bytes), hex);
+    assert_eq!(cbor2::serialized_size(&value).unwrap(), bytes.len() as u64);
 }
 
 #[test]
@@ -164,14 +176,6 @@ fn structs() {
     assert_wire(Unit, "f6"); // unit is null
 }
 
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
-enum Enum {
-    Unit,
-    Newtype(u32),
-    Tuple(u32, u32),
-    Struct { x: u32 },
-}
-
 #[test]
 fn enums() {
     roundtrip(Enum::Unit);
@@ -276,16 +280,6 @@ fn integer_wire_forms() {
     assert_wire(-2i128, "21");
 }
 
-// serde only reports a sequence length when the iterator's size hint is
-// exact, so a filtered iterator produces an indefinite-length array.
-struct Unsized;
-
-impl Serialize for Unsized {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq((1u8..=3).filter(|_| true))
-    }
-}
-
 // A map of unknown size produces an indefinite-length map.
 struct UnsizedMap;
 
@@ -300,9 +294,9 @@ impl Serialize for UnsizedMap {
 
 #[test]
 fn indefinite_containers_encode() {
-    assert_wire(Unsized, "9f010203ff");
+    assert_wire(UnsizedSeq, "9f010203ff");
     assert_eq!(
-        cbor2::from_slice::<Vec<u8>>(&cbor2::to_vec(&Unsized).unwrap()).unwrap(),
+        cbor2::from_slice::<Vec<u8>>(&cbor2::to_vec(&UnsizedSeq).unwrap()).unwrap(),
         vec![1, 2, 3]
     );
 

@@ -1,20 +1,11 @@
 //! Async complete-item I/O helpers.
 
-use std::future::Future;
+#[cfg(any(feature = "futures", feature = "tokio"))]
 use std::task::{Context, Poll};
 
 use cbor2::async_io::{self, AsyncRead, AsyncWrite};
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = std::task::Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut future = std::pin::pin!(future);
-
-    match future.as_mut().poll(&mut cx) {
-        Poll::Ready(value) => value,
-        Poll::Pending => panic!("test future unexpectedly pending"),
-    }
-}
+use crate::util::block_on;
 
 struct Cursor {
     data: Vec<u8>,
@@ -261,6 +252,8 @@ fn write_helpers_emit_exactly_one_item() {
     assert!(block_on(async_io::write_item(&mut Sink::default(), &item)).is_err());
 }
 
+// The futures adapters loop over short reads and writes themselves, so
+// these doubles move one byte per poll.
 #[cfg(feature = "futures")]
 struct FuturesCursor(Cursor);
 
@@ -272,7 +265,7 @@ impl futures_io::AsyncRead for FuturesCursor {
         buf: &mut [u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let remaining = self.0.data.len().saturating_sub(self.0.pos);
-        let n = remaining.min(buf.len());
+        let n = remaining.min(buf.len()).min(1);
         if n == 0 {
             return Poll::Ready(Ok(0));
         }
@@ -295,8 +288,9 @@ impl futures_io::AsyncWrite for FuturesSink {
         _cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        self.0.data.extend_from_slice(data);
-        Poll::Ready(Ok(data.len()))
+        let n = data.len().min(1);
+        self.0.data.extend_from_slice(&data[..n]);
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(
@@ -322,6 +316,10 @@ fn futures_async_traits_are_supported() {
     let mut reader = FuturesCursor(Cursor::new(first.clone()));
     let item = block_on(async_io::futures::read_item(&mut reader)).unwrap();
     assert_eq!(item, first);
+
+    // A stream ending mid-item is an error, not a short item.
+    let mut reader = FuturesCursor(Cursor::new(first[..first.len() - 1].to_vec()));
+    assert!(block_on(async_io::futures::read_item(&mut reader)).is_err());
 
     let mut reader = FuturesCursor(Cursor::new(first.clone()));
     let item = block_on(async_io::futures::read_item_with_limit(

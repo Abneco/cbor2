@@ -23,14 +23,14 @@ struct Signed {
 
 fn exact_item() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = cbor2::to_vec(&("ok", 7u8))?;
-    cbor2::validate(&bytes[..])?;
+    cbor2::validate_slice(&bytes)?;
 
     let decoded: (String, u8) = cbor2::from_slice(&bytes)?;
     assert_eq!(decoded, ("ok".to_string(), 7));
 
     let mut with_trailing = bytes.clone();
     with_trailing.push(0);
-    assert!(cbor2::validate(&with_trailing[..]).is_err());
+    assert!(cbor2::validate_slice(&with_trailing).is_err());
 
     let leading: (String, u8) = cbor2::from_slice(&with_trailing)?;
     assert_eq!(leading, decoded);
@@ -83,7 +83,7 @@ fn cbor_sequence() -> Result<(), Box<dyn std::error::Error>> {
     cbor2::to_writer(&"start", &mut stream)?;
     cbor2::to_writer(&42u8, &mut stream)?;
 
-    let items: Vec<cbor2::Value> = cbor2::de::Deserializer::from_reader(&stream[..])
+    let items: Vec<cbor2::Value> = cbor2::de::Deserializer::from_slice(&stream)
         .into_iter()
         .collect::<Result<_, _>>()?;
 
@@ -91,7 +91,13 @@ fn cbor_sequence() -> Result<(), Box<dyn std::error::Error>> {
         items,
         vec![cbor2::Value::from("start"), cbor2::Value::from(42)]
     );
-    assert!(cbor2::validate(&stream[..]).is_err());
+    assert!(cbor2::validate_slice(&stream).is_err());
+
+    // Streams use the reader deserializer and yield the same items.
+    let streamed: Vec<cbor2::Value> = cbor2::de::Deserializer::from_reader(&stream[..])
+        .into_iter()
+        .collect::<Result<_, _>>()?;
+    assert_eq!(streamed, items);
     Ok(())
 }
 

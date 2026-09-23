@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut bytes = Vec::new();
     cbor2::to_writer(&photo, &mut bytes)?;
-    cbor2::validate(&bytes[..])?;
+    cbor2::validate_slice(&bytes)?;
 
     let back: Photo = cbor2::from_slice(&bytes)?;
     assert_eq!(photo, back);

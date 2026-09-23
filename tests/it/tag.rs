@@ -110,262 +110,41 @@ fn oversized_bignums_stay_tagged() {
 }
 
 // A synthetic deserializer that presents the internal tag-protocol enum in
-// ways the CBOR deserializer never does: by variant index, by arbitrary
-// name, or as a non-enum value. This exercises the protocol's own
-// validation.
+// ways the CBOR deserializers never do: by variant index, by arbitrary name,
+// with a non-identifier variant, or with tuple items of the wrong type. It
+// exercises the protocol's own validation in the tag wrappers and in Value.
 mod synthetic {
     use serde::de::value::{
         BoolDeserializer, Error as DeError, SeqDeserializer, StrDeserializer, U64Deserializer,
     };
-    use serde::de::{self, IntoDeserializer};
+    use serde::de::{self, Expected, IntoDeserializer};
     use serde::forward_to_deserialize_any;
+    use serde::Deserialize;
 
     use cbor2::tag::AllowAny;
+    use cbor2::Value;
 
-    pub enum VariantId {
+    pub enum Variant {
         Index(u64),
         Name(&'static str),
         NotAnIdentifier,
     }
 
-    pub struct EnumDe {
-        pub variant: VariantId,
-        pub items: Vec<u64>,
+    // `I` is the type of the tuple items (the tag number, then the value).
+    pub struct EnumDe<I> {
+        pub variant: Variant,
+        pub items: Vec<I>,
     }
 
-    impl<'de> de::Deserializer<'de> for EnumDe {
+    fn enum_de<I>(variant: Variant, items: Vec<I>) -> EnumDe<I> {
+        EnumDe { variant, items }
+    }
+
+    impl<'de, I: IntoDeserializer<'de, DeError>> de::Deserializer<'de> for EnumDe<I> {
         type Error = DeError;
 
-        fn deserialize_any<V: de::Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
-            Err(de::Error::custom("not an enum"))
-        }
-
-        fn deserialize_enum<V: de::Visitor<'de>>(
-            self,
-            _: &'static str,
-            _: &'static [&'static str],
-            visitor: V,
-        ) -> Result<V::Value, Self::Error> {
-            visitor.visit_enum(self)
-        }
-
-        forward_to_deserialize_any! {
-            i8 i16 i32 i64 i128 u8 u16 u32 u64 u128
-            bool f32 f64 char str string bytes byte_buf
-            seq map struct tuple tuple_struct identifier ignored_any
-            option unit unit_struct newtype_struct
-        }
-    }
-
-    impl<'de> de::EnumAccess<'de> for EnumDe {
-        type Error = DeError;
-        type Variant = Self;
-
-        fn variant_seed<V: de::DeserializeSeed<'de>>(
-            self,
-            seed: V,
-        ) -> Result<(V::Value, Self::Variant), Self::Error> {
-            let value = match self.variant {
-                VariantId::Index(x) => seed.deserialize(U64Deserializer::new(x))?,
-                VariantId::Name(x) => seed.deserialize(StrDeserializer::new(x))?,
-                VariantId::NotAnIdentifier => seed.deserialize(BoolDeserializer::new(true))?,
-            };
-            Ok((value, self))
-        }
-    }
-
-    impl<'de> de::VariantAccess<'de> for EnumDe {
-        type Error = DeError;
-
-        fn unit_variant(self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn newtype_variant_seed<U: de::DeserializeSeed<'de>>(
-            self,
-            seed: U,
-        ) -> Result<U::Value, Self::Error> {
-            seed.deserialize(self.items[0].into_deserializer())
-        }
-
-        fn tuple_variant<V: de::Visitor<'de>>(
-            self,
-            _: usize,
-            visitor: V,
-        ) -> Result<V::Value, Self::Error> {
-            visitor.visit_seq(SeqDeserializer::new(self.items.into_iter()))
-        }
-
-        fn struct_variant<V: de::Visitor<'de>>(
-            self,
-            _: &'static [&'static str],
-            _: V,
-        ) -> Result<V::Value, Self::Error> {
-            Err(de::Error::custom("no structs here"))
-        }
-    }
-
-    fn allow_any(variant: VariantId, items: Vec<u64>) -> Result<AllowAny<u64>, DeError> {
-        use serde::Deserialize;
-        AllowAny::deserialize(EnumDe { variant, items })
-    }
-
-    #[test]
-    fn variant_indices_select_the_form() {
-        assert_eq!(
-            allow_any(VariantId::Index(0), vec![5]).unwrap(),
-            AllowAny(None, 5)
-        );
-        assert_eq!(
-            allow_any(VariantId::Index(1), vec![9, 5]).unwrap(),
-            AllowAny(Some(9), 5)
-        );
-
-        let msg = allow_any(VariantId::Index(2), vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("variant index 0 or 1"), "{msg}");
-    }
-
-    #[test]
-    fn variant_names_are_validated() {
-        assert_eq!(
-            allow_any(VariantId::Name("@@UNTAGGED@@"), vec![5]).unwrap(),
-            AllowAny(None, 5)
-        );
-
-        let msg = allow_any(VariantId::Name("bogus"), vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("unknown variant"), "{msg}");
-
-        let msg = allow_any(VariantId::NotAnIdentifier, vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("a tag variant identifier"), "{msg}");
-    }
-
-    #[test]
-    fn tagged_payload_lengths_are_validated() {
-        let msg = allow_any(VariantId::Index(1), vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("invalid length 0"), "{msg}");
-        assert!(msg.contains("a tag number and a value"), "{msg}");
-
-        let msg = allow_any(VariantId::Index(1), vec![9])
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("invalid length 1"), "{msg}");
-    }
-
-    #[test]
-    fn tagged_payloads_with_wrong_types_are_rejected() {
-        struct BadTagItems;
-
-        impl<'de> de::Deserializer<'de> for BadTagItems {
-            type Error = DeError;
-
-            fn deserialize_any<V: de::Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
-                Err(de::Error::custom("not an enum"))
-            }
-
-            fn deserialize_enum<V: de::Visitor<'de>>(
-                self,
-                _: &'static str,
-                _: &'static [&'static str],
-                visitor: V,
-            ) -> Result<V::Value, Self::Error> {
-                visitor.visit_enum(self)
-            }
-
-            forward_to_deserialize_any! {
-                i8 i16 i32 i64 i128 u8 u16 u32 u64 u128
-                bool f32 f64 char str string bytes byte_buf
-                seq map struct tuple tuple_struct identifier ignored_any
-                option unit unit_struct newtype_struct
-            }
-        }
-
-        impl<'de> de::EnumAccess<'de> for BadTagItems {
-            type Error = DeError;
-            type Variant = Self;
-
-            fn variant_seed<V: de::DeserializeSeed<'de>>(
-                self,
-                seed: V,
-            ) -> Result<(V::Value, Self::Variant), Self::Error> {
-                let value = seed.deserialize(StrDeserializer::new("@@TAGGED@@"))?;
-                Ok((value, self))
-            }
-        }
-
-        impl<'de> de::VariantAccess<'de> for BadTagItems {
-            type Error = DeError;
-
-            fn unit_variant(self) -> Result<(), Self::Error> {
-                Ok(())
-            }
-
-            fn newtype_variant_seed<U: de::DeserializeSeed<'de>>(
-                self,
-                seed: U,
-            ) -> Result<U::Value, Self::Error> {
-                seed.deserialize(StrDeserializer::new("x"))
-            }
-
-            fn tuple_variant<V: de::Visitor<'de>>(
-                self,
-                _: usize,
-                visitor: V,
-            ) -> Result<V::Value, Self::Error> {
-                // The tag number arrives as a string: u64 parsing fails.
-                visitor.visit_seq(SeqDeserializer::new(["oops"].into_iter()))
-            }
-
-            fn struct_variant<V: de::Visitor<'de>>(
-                self,
-                _: &'static [&'static str],
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                Err(de::Error::custom("no structs here"))
-            }
-        }
-
-        use serde::Deserialize;
-        assert!(AllowAny::<u64>::deserialize(BadTagItems).is_err());
-    }
-
-    #[test]
-    fn non_enum_input_is_rejected() {
-        use serde::Deserialize;
-
-        let err = AllowAny::<u64>::deserialize(BoolDeserializer::<DeError>::new(true));
-        let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("a possibly tagged value"), "{msg}");
-    }
-}
-
-// Value's visitor also absorbs the tag protocol when it arrives from a
-// foreign deserializer.
-mod foreign_value {
-    use serde::de::value::{Error as DeError, SeqDeserializer, StrDeserializer};
-    use serde::de::{self, Expected};
-    use serde::forward_to_deserialize_any;
-    use serde::Deserialize;
-
-    use cbor2::Value;
-
-    pub struct EnumDe {
-        pub variant: &'static str,
-        pub items: Vec<u64>,
-    }
-
-    impl<'de> de::Deserializer<'de> for EnumDe {
-        type Error = DeError;
-
-        // `Value::deserialize` only ever calls `deserialize_any`; present
-        // the enum from there.
+        // `Value::deserialize` calls `deserialize_any` and the tag wrappers
+        // call `deserialize_enum`; both see the enum.
         fn deserialize_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
             visitor.visit_enum(self)
         }
@@ -378,7 +157,7 @@ mod foreign_value {
         }
     }
 
-    impl<'de> de::EnumAccess<'de> for EnumDe {
+    impl<'de, I: IntoDeserializer<'de, DeError>> de::EnumAccess<'de> for EnumDe<I> {
         type Error = DeError;
         type Variant = Self;
 
@@ -386,12 +165,16 @@ mod foreign_value {
             self,
             seed: V,
         ) -> Result<(V::Value, Self::Variant), Self::Error> {
-            let value = seed.deserialize(StrDeserializer::new(self.variant))?;
+            let value = match self.variant {
+                Variant::Index(x) => seed.deserialize(U64Deserializer::new(x))?,
+                Variant::Name(x) => seed.deserialize(StrDeserializer::new(x))?,
+                Variant::NotAnIdentifier => seed.deserialize(BoolDeserializer::new(true))?,
+            };
             Ok((value, self))
         }
     }
 
-    impl<'de> de::VariantAccess<'de> for EnumDe {
+    impl<'de, I: IntoDeserializer<'de, DeError>> de::VariantAccess<'de> for EnumDe<I> {
         type Error = DeError;
 
         fn unit_variant(self) -> Result<(), Self::Error> {
@@ -402,7 +185,11 @@ mod foreign_value {
             self,
             seed: U,
         ) -> Result<U::Value, Self::Error> {
-            seed.deserialize(StrDeserializer::new("payload"))
+            let item = self.items.into_iter().next();
+            seed.deserialize(
+                item.ok_or_else(|| de::Error::custom("no payload"))?
+                    .into_deserializer(),
+            )
         }
 
         fn tuple_variant<V: de::Visitor<'de>>(
@@ -432,183 +219,98 @@ mod foreign_value {
         }
     }
 
-    #[test]
-    fn variant_identifier_seed_failures_propagate() {
-        // The variant name arrives as a bool: the String seed inside
-        // Value's enum visitor fails.
-        struct BadVariantDe;
-
-        impl<'de> de::Deserializer<'de> for BadVariantDe {
-            type Error = DeError;
-
-            fn deserialize_any<V: de::Visitor<'de>>(
-                self,
-                visitor: V,
-            ) -> Result<V::Value, Self::Error> {
-                visitor.visit_enum(self)
-            }
-
-            forward_to_deserialize_any! {
-                i8 i16 i32 i64 i128 u8 u16 u32 u64 u128
-                bool f32 f64 char str string bytes byte_buf
-                seq map struct tuple tuple_struct identifier ignored_any
-                option unit unit_struct newtype_struct enum
-            }
-        }
-
-        impl<'de> de::EnumAccess<'de> for BadVariantDe {
-            type Error = DeError;
-            type Variant = Self;
-
-            fn variant_seed<V: de::DeserializeSeed<'de>>(
-                self,
-                seed: V,
-            ) -> Result<(V::Value, Self::Variant), Self::Error> {
-                let value = seed.deserialize(serde::de::value::BoolDeserializer::new(true))?;
-                Ok((value, self))
-            }
-        }
-
-        impl<'de> de::VariantAccess<'de> for BadVariantDe {
-            type Error = DeError;
-
-            fn unit_variant(self) -> Result<(), Self::Error> {
-                Ok(())
-            }
-
-            fn newtype_variant_seed<U: de::DeserializeSeed<'de>>(
-                self,
-                _: U,
-            ) -> Result<U::Value, Self::Error> {
-                Err(de::Error::custom("unused"))
-            }
-
-            fn tuple_variant<V: de::Visitor<'de>>(
-                self,
-                _: usize,
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                Err(de::Error::custom("unused"))
-            }
-
-            fn struct_variant<V: de::Visitor<'de>>(
-                self,
-                _: &'static [&'static str],
-                _: V,
-            ) -> Result<V::Value, Self::Error> {
-                Err(de::Error::custom("unused"))
-            }
-        }
-
-        use serde::Deserialize;
-        assert!(Value::deserialize(BadVariantDe).is_err());
+    fn allow_any<I: IntoDeserializer<'static, DeError>>(
+        variant: Variant,
+        items: Vec<I>,
+    ) -> Result<AllowAny<u64>, DeError> {
+        AllowAny::deserialize(enum_de(variant, items))
     }
 
+    fn error<T>(result: Result<T, DeError>) -> String {
+        result
+            .err()
+            .expect("synthetic input must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn variant_indices_select_the_form() {
+        assert_eq!(
+            allow_any(Variant::Index(0), vec![5u64]).unwrap(),
+            AllowAny(None, 5)
+        );
+        assert_eq!(
+            allow_any(Variant::Index(1), vec![9u64, 5]).unwrap(),
+            AllowAny(Some(9), 5)
+        );
+
+        let msg = error(allow_any(Variant::Index(2), Vec::<u64>::new()));
+        assert!(msg.contains("variant index 0 or 1"), "{msg}");
+    }
+
+    #[test]
+    fn variant_names_are_validated() {
+        assert_eq!(
+            allow_any(Variant::Name("@@UNTAGGED@@"), vec![5u64]).unwrap(),
+            AllowAny(None, 5)
+        );
+
+        let msg = error(allow_any(Variant::Name("bogus"), Vec::<u64>::new()));
+        assert!(msg.contains("unknown variant"), "{msg}");
+
+        let msg = error(allow_any(Variant::NotAnIdentifier, Vec::<u64>::new()));
+        assert!(msg.contains("a tag variant identifier"), "{msg}");
+    }
+
+    #[test]
+    fn tagged_payload_lengths_are_validated() {
+        let msg = error(allow_any(Variant::Index(1), Vec::<u64>::new()));
+        assert!(msg.contains("invalid length 0"), "{msg}");
+        assert!(msg.contains("a tag number and a value"), "{msg}");
+
+        let msg = error(allow_any(Variant::Index(1), vec![9u64]));
+        assert!(msg.contains("invalid length 1"), "{msg}");
+    }
+
+    #[test]
+    fn tagged_payloads_with_wrong_types_are_rejected() {
+        // The tag number arrives as a string: u64 parsing fails.
+        let tagged = || enum_de(Variant::Name("@@TAGGED@@"), vec!["oops"]);
+        assert!(AllowAny::<u64>::deserialize(tagged()).is_err());
+        let msg = error(Value::deserialize(tagged()));
+        assert!(msg.contains("invalid type"), "{msg}");
+    }
+
+    #[test]
+    fn non_enum_input_is_rejected() {
+        let err = AllowAny::<u64>::deserialize(BoolDeserializer::<DeError>::new(true));
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("a possibly tagged value"), "{msg}");
+    }
+
+    // Value's visitor also absorbs the tag protocol from a foreign
+    // deserializer.
     #[test]
     fn value_accepts_the_tagged_variant() {
-        let value = Value::deserialize(EnumDe {
-            variant: "@@TAGGED@@",
-            items: vec![9, 5],
-        })
-        .unwrap();
-        assert_eq!(value, Value::Tag(9, Box::new(Value::from(5))));
-    }
-
-    #[test]
-    fn value_rejects_bad_tag_payload_types() {
-        // The tag number must parse as u64; a string payload fails inside
-        // the tuple access.
-        let err = Value::deserialize(BadItemsDe).unwrap_err().to_string();
-        assert!(err.contains("invalid type"), "{err}");
-    }
-
-    pub struct BadItemsDe;
-
-    impl<'de> de::Deserializer<'de> for BadItemsDe {
-        type Error = DeError;
-
-        fn deserialize_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-            visitor.visit_enum(self)
-        }
-
-        forward_to_deserialize_any! {
-            i8 i16 i32 i64 i128 u8 u16 u32 u64 u128
-            bool f32 f64 char str string bytes byte_buf
-            seq map struct tuple tuple_struct identifier ignored_any
-            option unit unit_struct newtype_struct enum
-        }
-    }
-
-    impl<'de> de::EnumAccess<'de> for BadItemsDe {
-        type Error = DeError;
-        type Variant = Self;
-
-        fn variant_seed<V: de::DeserializeSeed<'de>>(
-            self,
-            seed: V,
-        ) -> Result<(V::Value, Self::Variant), Self::Error> {
-            let value = seed.deserialize(StrDeserializer::new("@@TAGGED@@"))?;
-            Ok((value, self))
-        }
-    }
-
-    impl<'de> de::VariantAccess<'de> for BadItemsDe {
-        type Error = DeError;
-
-        fn unit_variant(self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn newtype_variant_seed<U: de::DeserializeSeed<'de>>(
-            self,
-            seed: U,
-        ) -> Result<U::Value, Self::Error> {
-            seed.deserialize(StrDeserializer::new("x"))
-        }
-
-        fn tuple_variant<V: de::Visitor<'de>>(
-            self,
-            _: usize,
-            visitor: V,
-        ) -> Result<V::Value, Self::Error> {
-            // The "tag number" is a string: u64 parsing must fail.
-            visitor.visit_seq(SeqDeserializer::new(["oops"].into_iter()))
-        }
-
-        fn struct_variant<V: de::Visitor<'de>>(
-            self,
-            _: &'static [&'static str],
-            _: V,
-        ) -> Result<V::Value, Self::Error> {
-            Err(de::Error::custom("no structs here"))
-        }
+        let value = Value::deserialize(enum_de(Variant::Name("@@TAGGED@@"), vec![9u64, 5]));
+        assert_eq!(value.unwrap(), Value::Tag(9, Box::new(Value::from(5))));
     }
 
     #[test]
     fn value_rejects_other_variants_and_short_payloads() {
-        let msg = Value::deserialize(EnumDe {
-            variant: "@@UNTAGGED@@",
-            items: vec![],
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(msg.contains("expected tag"), "{msg}");
+        for (variant, items, expected) in [
+            ("@@UNTAGGED@@", vec![], "expected tag"),
+            ("@@TAGGED@@", vec![], "expected tag"),
+            ("@@TAGGED@@", vec![9u64], "expected value"),
+        ] {
+            let msg = error(Value::deserialize(enum_de(Variant::Name(variant), items)));
+            assert!(msg.contains(expected), "{variant}: {msg}");
+        }
 
-        let msg = Value::deserialize(EnumDe {
-            variant: "@@TAGGED@@",
-            items: vec![],
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(msg.contains("expected tag"), "{msg}");
-
-        let msg = Value::deserialize(EnumDe {
-            variant: "@@TAGGED@@",
-            items: vec![9],
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(msg.contains("expected value"), "{msg}");
+        // The variant name arrives as a bool: the String seed inside
+        // Value's enum visitor fails.
+        let bad_name = enum_de(Variant::NotAnIdentifier, Vec::<u64>::new());
+        assert!(Value::deserialize(bad_name).is_err());
     }
 }
 

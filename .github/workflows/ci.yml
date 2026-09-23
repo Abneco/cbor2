@@ -26,6 +26,11 @@ jobs:
       - run: cargo test --workspace --all-targets --all-features
       - run: cargo test --workspace --all-features --doc
       - run: cargo test -p cbor2 --release --all-features --test it audit_regressions
+      - name: Run examples
+        run: |
+          for example in examples/*.rs; do
+            cargo run --quiet --all-features --example "$(basename "$example" .rs)" > /dev/null
+          done
 
   feature-tests:
     name: feature tests (${{ matrix.name }})

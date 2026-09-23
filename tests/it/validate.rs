@@ -122,7 +122,7 @@ fn malformed_input_is_rejected() {
     // Invalid UTF-8, in one piece and per segment.
     bad("62fffe");
     bad("7f62fffeff");
-    bad("7f61e261829461acff"); // characters split across segments
+    bad("7f62e28261acff"); // "€" split across segments
 
     // Trailing data.
     bad("0001");
@@ -137,39 +137,17 @@ fn malformed_input_is_rejected() {
 
 #[test]
 fn nesting_is_depth_limited() {
-    let mut array_bomb = vec![0x81u8; 65536];
-    *array_bomb.last_mut().unwrap() = 0x01;
-    assert!(matches!(
-        cbor2::validate(&array_bomb[..]),
-        Err(cbor2::de::Error::RecursionLimitExceeded)
-    ));
-    assert!(matches!(
-        cbor2::validate_slice(&array_bomb),
-        Err(cbor2::de::Error::RecursionLimitExceeded)
-    ));
-
-    let mut tag_bomb = vec![0xc1u8; 65536];
-    *tag_bomb.last_mut().unwrap() = 0x01;
-    assert!(matches!(
-        cbor2::validate(&tag_bomb[..]),
-        Err(cbor2::de::Error::RecursionLimitExceeded)
-    ));
-    assert!(matches!(
-        cbor2::validate_slice(&tag_bomb),
-        Err(cbor2::de::Error::RecursionLimitExceeded)
-    ));
-
-    // Mixed indefinite nesting is limited too.
-    let mut mixed = vec![0x9fu8; 65536];
-    *mixed.last_mut().unwrap() = 0x01;
-    assert!(matches!(
-        cbor2::validate(&mixed[..]),
-        Err(cbor2::de::Error::RecursionLimitExceeded)
-    ));
-    assert!(matches!(
-        cbor2::validate_slice(&mixed),
-        Err(cbor2::de::Error::RecursionLimitExceeded)
-    ));
+    // Definite arrays, tags and indefinite arrays alike.
+    for head in [0x81u8, 0xc1, 0x9f] {
+        let mut bomb = vec![head; 65536];
+        *bomb.last_mut().unwrap() = 0x01;
+        for result in [cbor2::validate(&bomb[..]), cbor2::validate_slice(&bomb)] {
+            assert!(
+                matches!(result, Err(cbor2::de::Error::RecursionLimitExceeded)),
+                "{head:02x}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -204,15 +182,8 @@ fn utf8_across_chunk_boundaries() {
 
 #[test]
 fn io_errors_propagate() {
+    use crate::util::FailReader;
     use std::io::Read;
-
-    struct FailReader;
-
-    impl Read for FailReader {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("source broke"))
-        }
-    }
 
     // A failure while reading the item is an I/O error...
     assert!(matches!(

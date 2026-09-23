@@ -207,7 +207,7 @@ fn marked_tags_accept_tagged_or_untagged() {
 #[test]
 fn marked_tags_on_tuple_structs_decode_untagged() {
     // The transparent tag behavior also covers tuple structs (array shape),
-    // exercising the `unwrap_struct_tag` path on the Value side.
+    // on both the stream and the Value paths.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     #[serde(rename = "@@CBOR@@16@@@@Pair")]
     struct Pair(u8, u8);
@@ -427,21 +427,7 @@ fn tagged_integer_keys_still_match() {
 
 #[test]
 fn marker_write_failures_propagate() {
-    struct Limited(usize);
-
-    impl std::io::Write for Limited {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            if self.0 == 0 {
-                return Err(std::io::Error::other("limit"));
-            }
-            let n = self.0.min(data.len());
-            self.0 -= n;
-            Ok(n)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    use crate::util::LimitedWriter as Limited;
 
     #[derive(Serialize)]
     #[serde(rename = "@@CBOR@@9@@a=1;b=-1@@T")]

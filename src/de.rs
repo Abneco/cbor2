@@ -902,8 +902,16 @@ impl<'de, S: BorrowSource<'de>> de::Deserializer<'de> for &mut Deserializer<S> {
             }
 
             // Bignums lossy-coerce into plain integers whenever they fit;
-            // otherwise they survive as a tagged byte string.
+            // otherwise they survive as a tagged byte string. A bignum tag
+            // around anything else is still well-formed and stays a tag.
             Header::Tag(tag @ (tag::BIGPOS | tag::BIGNEG)) => {
+                let payload = self.source.pull()?;
+                let bytes = matches!(payload, Header::Bytes(..));
+                self.source.push(payload);
+                if !bytes {
+                    return self.recurse(|me| visitor.visit_enum(TagAccess::new(me, Some(tag))));
+                }
+
                 let b = self.bignum()?;
 
                 let int = match big_to_u128(&b) {

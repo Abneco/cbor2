@@ -6,16 +6,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Fail($Message) {
-    Write-Error $Message
-    exit 1
-}
-
 $releasePath = (Resolve-Path -LiteralPath $ReleaseDir).ProviderPath
 $cborAsset = Join-Path $releasePath "cbor-$Target.exe"
 $outputPath = Join-Path $releasePath $OutputName
 
-if (!(Test-Path -LiteralPath $cborAsset -PathType Leaf)) { Fail "Missing $cborAsset" }
+if (!(Test-Path -LiteralPath $cborAsset -PathType Leaf)) { throw "Missing $cborAsset" }
 
 $staging = Join-Path $env:TEMP ("cbor2-cli-installer-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $staging | Out-Null
@@ -23,39 +18,47 @@ New-Item -ItemType Directory -Force -Path $staging | Out-Null
 try {
 Copy-Item -LiteralPath $cborAsset -Destination (Join-Path $staging "cbor.exe") -Force
 
-$setPathScript = @'
+# Adds the install directory to the front of the user PATH, or removes it
+# with -Remove. The raw registry value is edited: the .NET environment API
+# would expand %VARIABLE% entries on read and write them back as REG_SZ.
+$userPathScript = @'
 param(
     [Parameter(Mandatory=$true)]
-    [string]$InstallDir
+    [string]$InstallDir,
+    [switch]$Remove
 )
 
 $ErrorActionPreference = "Stop"
 
-function Add-PathPrefix($PathValue, $Directory) {
-    $normalizedDirectory = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd("\")
-    $entries = @()
-    if (-not [string]::IsNullOrWhiteSpace($PathValue)) {
-        foreach ($entry in ($PathValue -split ";")) {
-            if ([string]::IsNullOrWhiteSpace($entry)) {
-                continue
-            }
-
-            $normalizedEntry = [Environment]::ExpandEnvironmentVariables($entry).TrimEnd("\")
-            if ([string]::Equals($normalizedEntry, $normalizedDirectory, [StringComparison]::OrdinalIgnoreCase)) {
-                continue
-            }
-
-            $entries += $entry
-        }
+$key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+try {
+    $current = [string]$key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $directory = [Environment]::ExpandEnvironmentVariables($InstallDir).TrimEnd("\")
+    $entries = @($current -split ";" | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        -not [string]::Equals([Environment]::ExpandEnvironmentVariables($_).TrimEnd("\"), $directory, [StringComparison]::OrdinalIgnoreCase)
+    })
+    if (-not $Remove) {
+        $entries = @($InstallDir) + $entries
     }
 
-    return (@($Directory) + $entries) -join ";"
+    $updated = $entries -join ";"
+    if ($updated -eq $current) {
+        return
+    }
+    if ($updated) {
+        $key.SetValue("Path", $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    } else {
+        $key.DeleteValue("Path", $false)
+    }
+} finally {
+    $key.Dispose()
 }
 
-function Send-EnvironmentChanged {
-    try {
-        if (-not ("Cbor2Cli.NativeMethods" -as [type])) {
-            $signature = @"
+# Tell running programs such as Explorer that the environment changed.
+try {
+    if (-not ("Cbor2Cli.NativeMethods" -as [type])) {
+        Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 
@@ -72,114 +75,23 @@ namespace Cbor2Cli {
             out IntPtr lpdwResult);
     }
 }
-"@
-            Add-Type -TypeDefinition $signature | Out-Null
-        }
-
-        $result = [IntPtr]::Zero
-        [Cbor2Cli.NativeMethods]::SendMessageTimeout(
-            [IntPtr]0xffff,
-            0x1a,
-            [IntPtr]::Zero,
-            "Environment",
-            0x0002,
-            5000,
-            [ref]$result) | Out-Null
-    } catch {
+"@ | Out-Null
     }
-}
 
-$processPath = [Environment]::GetEnvironmentVariable("Path", "Process")
-$updatedProcessPath = Add-PathPrefix $processPath $InstallDir
-if ($updatedProcessPath -ne $processPath) {
-    [Environment]::SetEnvironmentVariable("Path", $updatedProcessPath, "Process")
-}
-
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-$updatedUserPath = Add-PathPrefix $userPath $InstallDir
-if ($updatedUserPath -ne $userPath) {
-    [Environment]::SetEnvironmentVariable("Path", $updatedUserPath, "User")
-    Send-EnvironmentChanged
+    $result = [IntPtr]::Zero
+    [Cbor2Cli.NativeMethods]::SendMessageTimeout(
+        [IntPtr]0xffff,
+        0x1a,
+        [IntPtr]::Zero,
+        "Environment",
+        0x0002,
+        5000,
+        [ref]$result) | Out-Null
+} catch {
 }
 '@
 
-Set-Content -LiteralPath (Join-Path $staging "set-user-path.ps1") -Value $setPathScript -Encoding ASCII
-
-$removePathScript = @'
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$InstallDir
-)
-
-$ErrorActionPreference = "Stop"
-
-function Remove-PathEntry($PathValue, $Directory) {
-    $normalizedDirectory = [Environment]::ExpandEnvironmentVariables($Directory).TrimEnd("\")
-    $entries = @()
-    if (-not [string]::IsNullOrWhiteSpace($PathValue)) {
-        foreach ($entry in ($PathValue -split ";")) {
-            if ([string]::IsNullOrWhiteSpace($entry)) {
-                continue
-            }
-
-            $normalizedEntry = [Environment]::ExpandEnvironmentVariables($entry).TrimEnd("\")
-            if ([string]::Equals($normalizedEntry, $normalizedDirectory, [StringComparison]::OrdinalIgnoreCase)) {
-                continue
-            }
-
-            $entries += $entry
-        }
-    }
-
-    return $entries -join ";"
-}
-
-function Send-EnvironmentChanged {
-    try {
-        if (-not ("Cbor2Cli.NativeMethods" -as [type])) {
-            $signature = @"
-using System;
-using System.Runtime.InteropServices;
-
-namespace Cbor2Cli {
-    public static class NativeMethods {
-        [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
-        public static extern IntPtr SendMessageTimeout(
-            IntPtr hWnd,
-            UInt32 Msg,
-            IntPtr wParam,
-            string lParam,
-            UInt32 fuFlags,
-            UInt32 uTimeout,
-            out IntPtr lpdwResult);
-    }
-}
-"@
-            Add-Type -TypeDefinition $signature | Out-Null
-        }
-
-        $result = [IntPtr]::Zero
-        [Cbor2Cli.NativeMethods]::SendMessageTimeout(
-            [IntPtr]0xffff,
-            0x1a,
-            [IntPtr]::Zero,
-            "Environment",
-            0x0002,
-            5000,
-            [ref]$result) | Out-Null
-    } catch {
-    }
-}
-
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-$updatedUserPath = Remove-PathEntry $userPath $InstallDir
-if ($updatedUserPath -ne $userPath) {
-    [Environment]::SetEnvironmentVariable("Path", $updatedUserPath, "User")
-    Send-EnvironmentChanged
-}
-'@
-
-Set-Content -LiteralPath (Join-Path $staging "remove-user-path.ps1") -Value $removePathScript -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $staging "user-path.ps1") -Value $userPathScript -Encoding ASCII
 
 $installScript = @'
 $ErrorActionPreference = "Stop"
@@ -191,10 +103,6 @@ Add-Type -AssemblyName System.Drawing
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\cbor2-cli"
 $StartMenuDir = Join-Path ([Environment]::GetFolderPath("Programs")) "cbor2-cli"
-$PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-if (!(Test-Path -LiteralPath $PowerShellExe)) {
-    $PowerShellExe = "powershell.exe"
-}
 
 function New-InstallerForm {
     $form = New-Object System.Windows.Forms.Form
@@ -241,56 +149,6 @@ function Set-InstallProgress($Value, $Message) {
     [System.Windows.Forms.Application]::DoEvents()
 }
 
-function Quote-ProcessArgument($Value) {
-    $text = [string]$Value
-    if ($text.Length -eq 0) {
-        return '""'
-    }
-    if ($text -notmatch '[\s"]') {
-        return $text
-    }
-
-    $quoted = '"'
-    $backslashes = 0
-    foreach ($ch in $text.ToCharArray()) {
-        if ($ch -eq '\') {
-            $backslashes += 1
-            continue
-        }
-        if ($ch -eq '"') {
-            $quoted += ('\' * ($backslashes * 2 + 1))
-            $quoted += '"'
-            $backslashes = 0
-            continue
-        }
-        if ($backslashes -gt 0) {
-            $quoted += ('\' * $backslashes)
-            $backslashes = 0
-        }
-        $quoted += $ch
-    }
-    if ($backslashes -gt 0) {
-        $quoted += ('\' * ($backslashes * 2))
-    }
-    $quoted += '"'
-    return $quoted
-}
-
-function Start-HiddenProcess($FilePath, [string[]]$ArgumentList = @(), [switch]$IgnoreExitCode) {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FilePath
-    $psi.Arguments = ($ArgumentList | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-
-    $process = [System.Diagnostics.Process]::Start($psi)
-    $process.WaitForExit()
-    if (!$IgnoreExitCode -and $process.ExitCode -ne 0) {
-        throw "$FilePath failed with exit code $($process.ExitCode)."
-    }
-}
-
 function Create-Shortcut($Path, $TargetPath, $WorkingDirectory, $Arguments = "") {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($Path)
@@ -310,12 +168,12 @@ function Write-Uninstaller {
         'set "START_MENU_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\cbor2-cli"',
         'set "POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"',
         'if not exist "%POWERSHELL%" set "POWERSHELL=powershell.exe"',
-        'if exist "%INSTALL_DIR%\remove-user-path.ps1" "%POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%INSTALL_DIR%\remove-user-path.ps1" -InstallDir "%INSTALL_DIR%"',
+        'if exist "%INSTALL_DIR%\user-path.ps1" "%POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%INSTALL_DIR%\user-path.ps1" -InstallDir "%INSTALL_DIR%" -Remove',
         'if exist "%START_MENU_DIR%" rmdir /S /Q "%START_MENU_DIR%"',
         'cd /D "%TEMP%"',
-        'rmdir /S /Q "%INSTALL_DIR%"',
-        'echo cbor2-cli has been uninstalled.',
-        'pause'
+        'rem This file is inside INSTALL_DIR: (goto) ends the batch file before it',
+        'rem is deleted, and the rest of this already-parsed line still runs.',
+        '(goto) 2>nul & rmdir /S /Q "%INSTALL_DIR%" & echo cbor2-cli has been uninstalled. & pause'
     )
     Set-Content -Path $uninstall -Value $lines -Encoding ASCII
     return $uninstall
@@ -335,10 +193,10 @@ try {
 
     Set-InstallProgress 35 "Installing cbor.exe..."
     Copy-Item -Force -LiteralPath (Join-Path $ScriptRoot "cbor.exe") -Destination (Join-Path $InstallDir "cbor.exe")
-    Copy-Item -Force -LiteralPath (Join-Path $ScriptRoot "remove-user-path.ps1") -Destination (Join-Path $InstallDir "remove-user-path.ps1")
+    Copy-Item -Force -LiteralPath (Join-Path $ScriptRoot "user-path.ps1") -Destination (Join-Path $InstallDir "user-path.ps1")
 
     Set-InstallProgress 65 "Updating PATH..."
-    Start-HiddenProcess $PowerShellExe @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ScriptRoot "set-user-path.ps1"), "-InstallDir", $InstallDir)
+    & (Join-Path $ScriptRoot "user-path.ps1") -InstallDir $InstallDir
 
     Set-InstallProgress 85 "Creating uninstall shortcut..."
     Create-Shortcuts
@@ -384,34 +242,32 @@ SourceFiles=SourceFiles
 [Strings]
 FILE0=cbor.exe
 FILE1=install.ps1
-FILE2=set-user-path.ps1
-FILE3=remove-user-path.ps1
+FILE2=user-path.ps1
 [SourceFiles]
 SourceFiles0=$staging
 [SourceFiles0]
 %FILE0%=
 %FILE1%=
 %FILE2%=
-%FILE3%=
 "@
 
 Set-Content -LiteralPath $sedPath -Value $sed -Encoding ASCII
 Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
 
 $iexpress = Join-Path $env:WINDIR "System32\iexpress.exe"
-if (!(Test-Path -LiteralPath $iexpress -PathType Leaf)) { Fail "iexpress.exe not found" }
+if (!(Test-Path -LiteralPath $iexpress -PathType Leaf)) { throw "iexpress.exe not found" }
 
 $process = Start-Process -FilePath $iexpress -ArgumentList @("/N", "/Q", $sedPath) -Wait -PassThru
 $exitCode = $process.ExitCode
 if ($null -ne $exitCode -and $exitCode -ne 0) {
-    Fail "iexpress.exe failed with exit code $exitCode"
+    throw "iexpress.exe failed with exit code $exitCode"
 }
 
 for ($i = 0; $i -lt 10 -and !(Test-Path -LiteralPath $outputPath -PathType Leaf); $i++) {
     Start-Sleep -Milliseconds 500
 }
 
-if (!(Test-Path -LiteralPath $outputPath -PathType Leaf)) { Fail "Installer was not created: $outputPath" }
+if (!(Test-Path -LiteralPath $outputPath -PathType Leaf)) { throw "Installer was not created: $outputPath" }
 
 Write-Host "Created $outputPath"
 } finally {

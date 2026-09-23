@@ -27,12 +27,12 @@ then gives the correct `cbor2` shape and the mistake to avoid.
 
 ## Decode a Buffer That Must Contain One Item
 
-Use `validate` as the exact-item gate. `from_slice` decodes the first item and
-does not enforce exhaustion.
+Use `validate_slice` as the exact-item gate for a buffer (`validate` for a
+reader). `from_slice` decodes the first item and does not enforce exhaustion.
 
 ```rust
 let bytes = cbor2::to_vec(&("ok", 7u8)).unwrap();
-cbor2::validate(&bytes[..]).unwrap();
+cbor2::validate_slice(&bytes).unwrap();
 
 let value: (String, u8) = cbor2::from_slice(&bytes).unwrap();
 assert_eq!(value, ("ok".to_string(), 7));
@@ -370,9 +370,11 @@ cbor validate a1616101
 Prefer `cbor encode --hex` in transcripts, tests and docs because it prints
 copyable lowercase hex instead of raw binary stdout. Use raw `cbor encode` only
 when the next command expects CBOR bytes on stdin. Add `--json` for strict JSON
-input, or `--diag`/`--cdn` for CDN input. `cbor validate` prints `valid` and
-exits 0 for one or more complete CBOR items; malformed data exits 1 and
-command-line usage errors exit 2.
+input, or `--diag`/`--cdn` for CDN input. Both input modes keep map entries in
+order, duplicate keys included, so the same JSON text encodes to the same
+bytes; `cbor decode --json` also keeps CBOR map order. `cbor validate` prints
+`valid` and exits 0 for one or more complete CBOR items; malformed data exits 1
+and command-line usage errors exit 2.
 
 ## Migrate From ciborium or serde_cbor
 

@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use cbor2::{cbor, Value};
 use serde::{Deserialize, Serialize};
 
+use crate::util::{Enum, LimitedWriter, UnsizedSeq};
+
 fn assert_size<T: ?Sized + Serialize>(value: &T) {
     let actual = cbor2::to_vec(value).unwrap().len() as u64;
     assert_eq!(cbor2::serialized_size(value).unwrap(), actual);
@@ -15,14 +17,6 @@ fn assert_size<T: ?Sized + Serialize>(value: &T) {
 struct Struct {
     a: u8,
     b: String,
-}
-
-#[derive(Serialize)]
-enum Enum {
-    Unit,
-    Newtype(u32),
-    Tuple(u32, u32),
-    Struct { x: u8 },
 }
 
 #[test]
@@ -150,16 +144,6 @@ fn tags_and_values() {
     assert_size(&Value::Tag(99, Box::new(value)));
 }
 
-// serde only reports a sequence length when the size hint is exact, so a
-// filtered iterator produces an indefinite-length array.
-struct UnsizedSeq;
-
-impl Serialize for UnsizedSeq {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq((1u8..=3).filter(|_| true))
-    }
-}
-
 #[test]
 fn indefinite_containers() {
     assert_size(&UnsizedSeq);
@@ -260,27 +244,13 @@ fn misbehaving_display_is_rejected() {
     ));
 
     // An I/O failure while streaming the body is an I/O error.
-    struct Limited(usize);
-    impl std::io::Write for Limited {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            if self.0 == 0 {
-                return Err(std::io::Error::other("limit"));
-            }
-            let n = self.0.min(data.len());
-            self.0 -= n;
-            Ok(n)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     assert!(matches!(
-        cbor2::to_writer(&Displayed, Limited(1)),
+        cbor2::to_writer(&Displayed, LimitedWriter(1)),
         Err(cbor2::ser::Error::Io(..))
     ));
     // And while writing the text header itself.
     assert!(matches!(
-        cbor2::to_writer(&Displayed, Limited(0)),
+        cbor2::to_writer(&Displayed, LimitedWriter(0)),
         Err(cbor2::ser::Error::Io(..))
     ));
 }

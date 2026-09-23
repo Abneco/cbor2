@@ -6,16 +6,10 @@ use cbor2::de::Error;
 use cbor2::Value;
 use serde::Deserialize;
 
+use crate::util::Enum;
+
 fn de<T: serde::de::DeserializeOwned>(hex: &str) -> Result<T, Error> {
     cbor2::from_slice(&hex::decode(hex).unwrap())
-}
-
-#[derive(Debug, PartialEq, Deserialize)]
-enum Enum {
-    Unit,
-    Newtype(u32),
-    Tuple(u32, u32),
-    Struct { x: u32 },
 }
 
 #[derive(Debug, PartialEq)]
@@ -179,62 +173,40 @@ fn primitive_bignum_range_rejection_stops_before_large_body() {
         }
     }
 
-    fn huge_bignum(tag: u8, fill: u8) -> CountingReader {
-        let mut data = vec![tag, 0x5a, 0x00, 0x10, 0x00, 0x00]; // tag(h'..' 1 MiB)
+    // tag(h'..') or tag((_ h'..')) with a 1 MiB body.
+    fn huge_bignum(tag: u8, fill: u8, segmented: bool) -> CountingReader {
+        let mut data = vec![tag];
+        if segmented {
+            data.push(0x5f);
+        }
+        data.extend([0x5a, 0x00, 0x10, 0x00, 0x00]);
         data.extend(vec![fill; 1 << 20]);
+        if segmented {
+            data.push(0xff);
+        }
         CountingReader { data, pos: 0 }
     }
 
-    fn huge_segmented_bignum(tag: u8, fill: u8) -> CountingReader {
-        let mut data = vec![tag, 0x5f, 0x5a, 0x00, 0x10, 0x00, 0x00]; // tag((_ h'..') 1 MiB)
-        data.extend(vec![fill; 1 << 20]);
-        data.push(0xff);
-        CountingReader { data, pos: 0 }
+    for (tag, fill, segmented) in [
+        (0xc2, 0xff, false),
+        (0xc3, 0xff, false),
+        (0xc2, 0x00, false),
+        (0xc2, 0x00, true),
+    ] {
+        let mut reader = huge_bignum(tag, fill, segmented);
+        let error = if tag == 0xc3 {
+            cbor2::from_reader::<i64, _>(&mut reader).map(drop)
+        } else {
+            cbor2::from_reader::<u64, _>(&mut reader).map(drop)
+        };
+        let msg = error.unwrap_err().to_string();
+        assert!(msg.contains("integer too large"), "{msg}");
+        assert!(
+            reader.pos < 1024,
+            "reader consumed {} bytes before rejecting",
+            reader.pos
+        );
     }
-
-    let mut reader = huge_bignum(0xc2, 0xff);
-    let msg = cbor2::from_reader::<u64, _>(&mut reader)
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("integer too large"), "{msg}");
-    assert!(
-        reader.pos < 1024,
-        "reader consumed {} bytes before rejecting",
-        reader.pos
-    );
-
-    let mut reader = huge_bignum(0xc3, 0xff);
-    let msg = cbor2::from_reader::<i64, _>(&mut reader)
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("integer too large"), "{msg}");
-    assert!(
-        reader.pos < 1024,
-        "reader consumed {} bytes before rejecting",
-        reader.pos
-    );
-
-    let mut reader = huge_bignum(0xc2, 0x00);
-    let msg = cbor2::from_reader::<u64, _>(&mut reader)
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("integer too large"), "{msg}");
-    assert!(
-        reader.pos < 1024,
-        "reader consumed {} bytes before rejecting",
-        reader.pos
-    );
-
-    let mut reader = huge_segmented_bignum(0xc2, 0x00);
-    let msg = cbor2::from_reader::<u64, _>(&mut reader)
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("integer too large"), "{msg}");
-    assert!(
-        reader.pos < 1024,
-        "reader consumed {} bytes before rejecting",
-        reader.pos
-    );
 }
 
 #[test]
@@ -288,6 +260,24 @@ fn bignums_collapse_or_stay_tagged_in_any() {
     // Leading zeros in bignums are tolerated everywhere.
     assert_eq!(de::<u8>("c243000007").unwrap(), 7);
     assert_eq!(de::<Value>("c243000007").unwrap(), Value::from(7));
+
+    // A bignum tag around anything but a byte string is well-formed and
+    // stays an ordinary tag, so Value round-trips it on both paths.
+    for (hex, value) in [
+        ("c2f6", Value::Tag(2, Box::new(Value::Null))),
+        ("c36178", Value::Tag(3, Box::new(Value::from("x")))),
+    ] {
+        assert_eq!(de::<Value>(hex).unwrap(), value, "{hex}");
+        assert_eq!(hex::encode(cbor2::to_vec(&value).unwrap()), hex);
+    }
+    // A nested bignum still collapses inside the outer tag.
+    assert_eq!(
+        de::<Value>("c2c24101").unwrap(),
+        Value::Tag(2, Box::new(Value::from(1)))
+    );
+    // Typed integers still require a byte-string payload.
+    assert!(de::<u64>("c2f6").is_err());
+    assert!(de::<Value>("c2ff").is_err());
 }
 
 #[test]

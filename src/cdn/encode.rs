@@ -56,6 +56,10 @@ fn write_preferred_uint(out: &mut Vec<u8>, major: u8, value: u64) {
 // Writes a small integer (major type 0 or 1) in preferred form. Callers only
 // pass values well inside the CBOR integer range: epochs, flags and ports.
 pub(super) fn write_int(out: &mut Vec<u8>, value: i128) {
+    debug_assert!(
+        (-(u64::MAX as i128) - 1..=u64::MAX as i128).contains(&value),
+        "write_int value {value} is outside the CBOR integer range"
+    );
     match u64::try_from(value) {
         Ok(n) => write_preferred_uint(out, 0, n),
         Err(..) => write_preferred_uint(out, 1, (-1 - value) as u64),
